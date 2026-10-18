@@ -56,7 +56,7 @@ These settings configure the proxy process. Claude Code client settings such as 
 }
 ```
 
-All keys are optional. An unreadable file, malformed JSON, or incompatible field type causes the file configuration to be ignored and built-in or environment values to apply.
+All keys are optional. For existing providers, an unreadable file, malformed JSON, or incompatible field type causes the file configuration to be ignored and built-in or environment values to apply. The experimental Antigravity adapter instead fails closed on invalid configuration; discovery reports bounded status enums without raw parse errors.
 
 ## Core and diagnostics
 
@@ -74,7 +74,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 
 `CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
 
-Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
+Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for detected classifier requests without changing the session's provider affinity. **Exception:** explicit Antigravity requests ignore cross-provider auto-review overrides. Same-provider overrides still undergo exact replay/model validation; changing tiers with signed history is rejected. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
 
 ## Outbound proxies
 
@@ -154,6 +154,65 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CURSOR_CLIENT_VERSION` | `cursor.clientVersion` | `0.48.5` | Changes Cursor client version headers. |
 | `CCP_CURSOR_AGENT_BUNDLE` | `cursor.agentBundle` | Auto-detected | Points to Cursor Agent's bundled `index.js` protobuf schemas. |
 | `CCP_CURSOR_AUTH_TOKEN` | none | unset | Uses a bearer token instead of proxy-owned Cursor auth storage. |
+
+## Experimental Antigravity
+
+Disabled by default. This native Argon adapter is unofficial, not generic Gemini API
+support and not a promise of Google account entitlement. Authentication commands
+remain available while disabled. Do not enable it in a production session before
+separate real-account OAuth/native smoke validation.
+
+| Environment | Config key | Default | Purpose |
+| --- | --- | --- | --- |
+| `CCP_ANTIGRAVITY_ENABLED` | `antigravity.enabled` | `false` | Explicit opt-in. Environment accepts only `1`/`true` or `0`/`false`; file value is boolean. |
+| `CCP_ANTIGRAVITY_CLIENT_ID` | `antigravity.clientId` | unset | Your public installed-app OAuth client ID; required for login and refresh. |
+| `CCP_ANTIGRAVITY_CLIENT_SECRET` | `antigravity.clientSecret` | unset | Optional public-client application secret, when required by that registered application. Not a user bearer token. |
+| `CCP_ANTIGRAVITY_PROJECT_ID` | `antigravity.projectId` | stored discovery result | Your authorized project; no borrowed project or automatic onboarding. |
+| `CCP_ANTIGRAVITY_BASE_URL` | `antigravity.baseUrl` | `https://cloudcode-pa.googleapis.com` | Explicit trusted HTTPS origin override. No userinfo, query, fragment, or path. Never automatically falls back to another endpoint. |
+
+Remote endpoints require HTTPS, redirects are never followed, and OAuth endpoints
+are fixed to `https://accounts.google.com/o/oauth2/v2/auth` and
+`https://oauth2.googleapis.com/token`. Plain loopback HTTP endpoints exist only as
+injected test fixtures, not environment/config options. The HTTP User-Agent
+identifies `claude-code-proxy` and its real platform as an Antigravity-compatible
+client. Product selectors `userAgent: antigravity` and `requestType: agent` do not
+claim an official CLI build or device identity.
+
+Login requests explicit browser consent, offline access, PKCE S256, independent
+one-time state, and an ephemeral `127.0.0.1` callback. The reference-protocol scopes
+are `https://www.googleapis.com/auth/` followed by `cloud-platform`, `userinfo.email`,
+`userinfo.profile`, `cclog`, and `experimentsandconfigs`. These are reference
+compatibility scopes, not independently proven minimal scopes. No `agy`, Gemini,
+Codex, keychain or other application's credentials are discovered or imported.
+
+Only `CCP_CONFIG_DIR/antigravity/auth.json` is used. Atomic private writes use mode
+0600 on Unix, under a mode-0700 provider directory. A stable sibling `auth.lock`
+coordinates login/logout/refresh across processes; logout never removes that
+lock. Missing, invalid and unreadable storage remain distinct. Local logout resolves
+this exact store path independently of transport settings, so malformed JSON or
+an invalid API URL does not prevent deleting this provider's credential. It does
+not remove another provider's state.
+
+Refresh preserves the profile ID and retains the old refresh token when rotation
+is omitted. A bounded manager-owned, single-flight transaction acquires the stable
+lock **before** contacting OAuth. Cancelling an inference waiter cannot discard a
+completed rotation: credential maintenance may finish after disconnection, but
+never starts or continues model generation. The 30-second network phase ends
+before validated replacement persistence. Filesystem writes are synchronous and
+are not claimed cancellable by that timer.
+
+If persistence fails, the manager retains the replacement in memory, scoped to
+the profile, lock epoch and superseded refresh token, and reports a typed pending-
+persistence error. Subsequent requests retry the local write, not the obsolete
+token. Logout/new login or a different committed refresh token invalidates that
+pending scope. An ambiguous network timeout/error requires explicit login rather
+than automatically reusing a potentially consumed token. Graceful server shutdown
+joins owned maintenance and attempts only pending local persistence; it performs
+no new refresh or inference. Forced process termination/crashes between remote
+rotation and durable storage are not covered by this in-memory recovery. Google's
+immediate refresh-token invalidation behavior remains unverified.
+
+A new login changes the profile and invalidates prior session replay.
 
 ## Shared compatibility fallbacks
 

@@ -105,6 +105,16 @@ The opt-in Images API returns base64 image data and consumes the signed-in accou
 Run `claude-code-proxy models` for the current catalog or
 `claude-code-proxy models --full` for every dynamic Cursor alias.
 
+An additional **experimental, default-off native Antigravity Argon adapter** supports
+only `antigravity/gemini-4-argon-low`, `antigravity/gemini-4-argon-medium`, and
+`antigravity/gemini-4-argon-high`. It does not run or import credentials from `agy`.
+Use a fresh session for every model/tier/profile change. Real Google OAuth,
+entitlement, native tool round trips and all three tiers remain live-validation
+gates; offline tests are not evidence of account access. See the
+[Antigravity limitations](docs/src/content/docs/reference/compatibility-and-limitations.md#experimental-native-antigravity-argon)
+and [configuration](docs/src/content/docs/reference/configuration.md#experimental-antigravity)
+before explicitly enabling it. Existing provider defaults and aliases are unchanged.
+
 > [!WARNING]
 > The proxy accepts local requests without client authentication. It binds to
 > `127.0.0.1` by default. Protect any non-loopback listener with a firewall or

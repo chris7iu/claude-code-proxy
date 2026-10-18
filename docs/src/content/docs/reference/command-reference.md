@@ -70,6 +70,7 @@ claude-code-proxy <provider> auth <action>
 | `kimi` | Device code | Unsupported | User, expiry, scope, storage | Delete proxy credential |
 | `grok` | Browser PKCE | Device code | Expiry and storage | Delete proxy credential |
 | `cursor` | Browser polling flow | Unsupported | Source, claims, expiry | Delete proxy credential |
+| `antigravity` (experimental) | Explicit browser PKCE | Unsupported | Safe local readiness, optional `--json` | Delete only Antigravity credential |
 
 Examples:
 
@@ -80,7 +81,25 @@ claude-code-proxy kimi auth status
 claude-code-proxy cursor auth logout
 ```
 
-A missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.
+For existing providers, a missing credential makes `auth status` exit with status 1. Other provider command failures exit with status 2. Successful commands exit with status 0.
+
+Antigravity auth commands work even while inference is disabled:
+
+```sh
+claude-code-proxy antigravity auth status --json
+claude-code-proxy antigravity auth login
+claude-code-proxy antigravity auth logout
+```
+
+Configure your installed-app client ID before explicit login; see
+[Antigravity configuration](/reference/configuration/#experimental-antigravity).
+`status --json` is Antigravity-only and emits schema version 1, `provider:
+antigravity`, plus the safe provider descriptor documented under
+[model discovery](/reference/http-api/#get-v1models). A successfully emitted
+report exits 0 even for missing/invalid/unready credentials. Inspection performs
+no network, refresh, directory creation or writes. CLI readiness describes this
+CLI's configuration, not a different running proxy, and never proves live access.
+Auth invocation failures exit nonzero. No existing provider gains a `--json` flag.
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
 
