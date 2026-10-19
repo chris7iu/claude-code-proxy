@@ -234,7 +234,7 @@ Cross-provider overrides out of explicit Antigravity routes remain blocked.
 
 Synthetic Rust HTTP/OAuth tests and an isolated real-client replay fixture do not
 prove Google acceptance, entitlement, billing or native model limits. Browser
-OAuth with the configured client, project readiness, truthful proxy identity,
+OAuth with the configured client, project readiness, the selected HTTP identity,
 native text/reasoning/tool round trips and **all three tiers** still require
 real-account smoke validation before activation. Low has public request-shape
 evidence; Medium/High encodings are catalog-inferred. Catalog evidence indicates
@@ -242,6 +242,21 @@ Google AI Ultra, but actual access responses remain authoritative. Automatic
 long-context compaction and native compaction acceptance are unverified. A
 manual real-client compact/resume fixture does not establish general compaction
 support.
+
+The default HTTP User-Agent is exactly `claude-code-proxy/<package version>` on
+all Antigravity operations. An explicit `CCP_ANTIGRAVITY_USER_AGENT` or
+`antigravity.userAgent` override is verbatim compatibility metadata applied only to
+native generation and `loadCodeAssist`; OAuth exchange and refresh keep proxy
+identification. The historical CLI 1.3.5 / changelist 998863838 example comes from
+this pinned public generation fixture:
+https://github.com/cortexkit/antigravity-auth/blob/f5a836df058a99cee6099ad308b9675e4ef11026/test-fixtures/agy-cli-1.3.5/native-argon-low.json.
+Project-discovery use is reference-adapter behavior, not a new official capture.
+The override is not a host-platform assertion, account verification or
+attestation. Exact CLI 1.4.2 matching and provider policy/terms compatibility are
+unverified. There is no runtime CLI detection, automatic profile upgrade, device
+identity fabrication or change to OAuth clients/scopes. User-Agent is not
+authentication and cannot establish access. See
+[override validation and precedence](/reference/configuration/#experimental-antigravity).
 
 ### Optional offline client fixture
 
@@ -306,7 +321,7 @@ Protocol references were independently translated from MIT-licensed
 https://github.com/cortexkit/antigravity-auth/tree/f5a836df058a99cee6099ad308b9675e4ef11026.
 Copyright (c) 2025 Jens; the reference license is retained in
 `meta/antigravity-reference-LICENSE`. No full captured CLI system prompts,
-proprietary descriptions, binaries, fingerprint impersonation or signature-bypass
+proprietary descriptions, binaries, device/session fingerprint fabrication or signature-bypass
 code are included. Test vectors contain synthetic/minimized data only.
 
 ## Diagnostics and privacy

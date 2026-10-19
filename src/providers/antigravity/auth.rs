@@ -327,6 +327,7 @@ impl Auth {
                 )
                 .timeout(Duration::from_secs(30))
                 .bearer_auth(&credential.access_token)
+                .headers(self.config.native_headers())
                 .json(&json!({"metadata":{"ideType":"ANTIGRAVITY","pluginType":"GEMINI"}}))
                 .send()
                 .await

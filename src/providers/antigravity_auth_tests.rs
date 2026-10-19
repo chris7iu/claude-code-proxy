@@ -502,6 +502,95 @@ async fn antigravity_logout_and_new_login_cannot_be_overwritten_by_refresh() {
 }
 
 #[tokio::test]
+async fn antigravity_user_agent_oauth_and_project_wire_matrix() {
+    for override_value in [
+        None,
+        Some("sentinel-native/9  (exact project identity)"),
+        Some(
+            "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; cl=998863838; auth_method=consumer)",
+        ),
+    ] {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tokens = captured.clone();
+        let projects = captured.clone();
+        let server = Server::start(Router::new()
+            .route("/token", post(move |headers: http::HeaderMap, axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>| {
+                let captured = tokens.clone();
+                async move {
+                    captured.lock().unwrap().push((form["grant_type"].clone(), headers));
+                    Json(json!({"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expires_in":3600}))
+                }
+            }))
+            .route("/v1internal:loadCodeAssist", post(move |headers: http::HeaderMap, Json(body): Json<Value>| {
+                let captured = projects.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer synthetic-access");
+                    assert!(body.get("metadata").is_some());
+                    captured.lock().unwrap().push(("project".into(), headers));
+                    Json(json!({"cloudaicompanionProject":"synthetic-project"}))
+                }
+            }))).await;
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            base_url: server.url.clone(),
+            token_url: server.url.join("/token").unwrap(),
+            client_id: Some("public-client".into()),
+            ..Config::read(&directory.path().join("config.json"), |key| {
+                if key == "CCP_ANTIGRAVITY_USER_AGENT" {
+                    override_value.map(Into::into)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+        };
+        let auth = Auth::new(config, Store::new(directory.path().join("auth.json"))).unwrap();
+        let mut callback = None;
+        auth.login_with_opener(|url| {
+            let pairs = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut redirect = url::Url::parse(&pairs["redirect_uri"]).unwrap();
+            redirect.query_pairs_mut().extend_pairs([
+                ("state", pairs["state"].as_ref()),
+                ("code", "synthetic-code"),
+            ]);
+            callback = Some(tokio::spawn(async move {
+                reqwest::Client::new().get(redirect).send().await.unwrap()
+            }));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(callback.unwrap().await.unwrap().status(), 200);
+        let mut credential = auth.store.load().unwrap().unwrap();
+        credential.expires_at = 0;
+        saved(&auth.store, &credential).await;
+        auth.access().await.unwrap();
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let proxy_identity = format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"));
+        for ((operation, headers), expected_operation) in
+            requests
+                .iter()
+                .zip(["authorization_code", "project", "refresh_token"])
+        {
+            assert_eq!(operation, expected_operation);
+            assert_eq!(headers.get_all("user-agent").iter().count(), 1);
+            let expected = if operation == "project" {
+                override_value
+                    .map(str::to_owned)
+                    .unwrap_or_else(super::antigravity_http_tests::expected_native_user_agent)
+            } else {
+                proxy_identity.clone()
+            };
+            assert_eq!(headers["user-agent"], expected);
+            assert!(!headers.contains_key("cookie"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn antigravity_explicit_login_exchanges_pkce_and_saves_discovered_project() {
     for project in [
         json!("discovered-project"),
@@ -694,7 +783,10 @@ async fn antigravity_redirects_do_not_leak_bearer_or_refresh_credentials() {
     let config = Config {
         token_url: redirect.url.clone(),
         client_id: Some("synthetic-client".into()),
-        ..Config::default()
+        ..Config::read(&directory.path().join("config.json"), |key| {
+            (key == "CCP_ANTIGRAVITY_USER_AGENT").then(|| "configured-no-redirect-UA".into())
+        })
+        .unwrap()
     };
     let auth = Auth::new(config, store).unwrap();
     assert!(auth.access().await.is_err());
@@ -703,6 +795,7 @@ async fn antigravity_redirects_do_not_leak_bearer_or_refresh_credentials() {
         .client
         .post(redirect.url.clone())
         .bearer_auth("synthetic-access")
+        .headers(auth.config.native_headers())
         .send()
         .await
         .unwrap();

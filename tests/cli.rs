@@ -98,6 +98,120 @@ fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn antigravity_user_agent_status_is_bounded_and_logout_ignores_invalid_transport() {
+    for value in ["sentinel-native-UA", "sentinel-invalid\tUA", ""] {
+        let directory = TempDir::new().unwrap();
+        let output = Command::cargo_bin("claude-code-proxy")
+            .unwrap()
+            .args(["antigravity", "auth", "status"])
+            .env("CCP_CONFIG_DIR", directory.path())
+            .env("CCP_ANTIGRAVITY_USER_AGENT", value)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            status["status"]["configuration"],
+            if value == "sentinel-native-UA" {
+                "valid"
+            } else {
+                "invalid"
+            }
+        );
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["status"]["live_verified"], false);
+        assert_eq!(status["backend_window_verified"], false);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("sentinel"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("sentinel"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        let models = Command::cargo_bin("claude-code-proxy")
+            .unwrap()
+            .args(["models", "--full"])
+            .env("CCP_CONFIG_DIR", directory.path())
+            .env("CCP_ANTIGRAVITY_USER_AGENT", value)
+            .output()
+            .unwrap();
+        assert!(models.status.success());
+        let models = String::from_utf8(models.stdout).unwrap();
+        assert!(!models.contains("antigravity/gemini"));
+        assert!(models.contains("codex:"));
+        let auth_dir = directory.path().join("antigravity");
+        std::fs::create_dir(&auth_dir).unwrap();
+        std::fs::write(auth_dir.join("auth.json"), b"synthetic local credential").unwrap();
+        std::fs::write(directory.path().join("other-provider-state"), b"untouched").unwrap();
+        Command::cargo_bin("claude-code-proxy")
+            .unwrap()
+            .args(["antigravity", "auth", "logout"])
+            .env("CCP_CONFIG_DIR", directory.path())
+            .env("CCP_ANTIGRAVITY_USER_AGENT", value)
+            .assert()
+            .success();
+        assert!(!directory.path().join("antigravity/auth.json").exists());
+        assert_eq!(
+            std::fs::read(directory.path().join("other-provider-state")).unwrap(),
+            b"untouched"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_user_agent_non_utf8_environment_fails_closed() {
+    use std::os::unix::ffi::OsStringExt;
+    for enabled in ["0", "1"] {
+        let directory = TempDir::new().unwrap();
+        let output = Command::cargo_bin("claude-code-proxy")
+            .unwrap()
+            .args(["antigravity", "auth", "status"])
+            .env("CCP_CONFIG_DIR", directory.path())
+            .env("CCP_ANTIGRAVITY_ENABLED", enabled)
+            .env(
+                "CCP_ANTIGRAVITY_USER_AGENT",
+                std::ffi::OsString::from_vec(b"sentinel-non-utf8-\xff".to_vec()),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status["status"]["configuration"], "invalid");
+        assert_eq!(status["status"]["configuration_ready"], false);
+        assert_eq!(status["enabled"], false);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("sentinel"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("sentinel"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn antigravity_user_agent_non_utf8_logout_still_deletes_only_local_credentials() {
+    use std::os::unix::ffi::OsStringExt;
+    let directory = TempDir::new().unwrap();
+    let auth_dir = directory.path().join("antigravity");
+    std::fs::create_dir(&auth_dir).unwrap();
+    std::fs::write(auth_dir.join("auth.json"), b"synthetic-local-credential").unwrap();
+    std::fs::write(directory.path().join("unrelated-state"), b"untouched").unwrap();
+    let output = Command::cargo_bin("claude-code-proxy")
+        .unwrap()
+        .args(["antigravity", "auth", "logout"])
+        .env("CCP_CONFIG_DIR", directory.path())
+        .env(
+            "CCP_ANTIGRAVITY_USER_AGENT",
+            std::ffi::OsString::from_vec(b"sentinel-non-utf8-\xff".to_vec()),
+        )
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(!auth_dir.join("auth.json").exists());
+    assert_eq!(
+        std::fs::read(directory.path().join("unrelated-state")).unwrap(),
+        b"untouched"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("sentinel"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("sentinel"));
+}
+
+#[test]
 fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["models", "--full"]);
@@ -173,6 +287,115 @@ fn wait_for_exit(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_user_agent_invalid_environment_is_scoped_to_native_provider()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+    for enabled in ["0", "1"] {
+        for invalid in [
+            b"sentinel-invalid\tUA".to_vec(),
+            b"sentinel-invalid-\xff".to_vec(),
+        ] {
+            let directory = TempDir::new()?;
+            let upstream = TcpListener::bind("127.0.0.1:0")?;
+            upstream.set_nonblocking(true)?;
+            let config = serde_json::json!({"antigravity": {
+                "userAgent": "file-native-fallback",
+                "baseUrl": format!("https://{}", upstream.local_addr()?)
+            }});
+            std::fs::write(directory.path().join("config.json"), config.to_string())?;
+            let auth_dir = directory.path().join("antigravity");
+            std::fs::create_dir(&auth_dir)?;
+            std::fs::set_permissions(&auth_dir, std::fs::Permissions::from_mode(0o700))?;
+            let auth_path = auth_dir.join("auth.json");
+            std::fs::write(&auth_path, serde_json::json!({
+                "profile_id":"synthetic-profile", "project_id":"synthetic-project",
+                "access_token":"synthetic-access", "refresh_token":null, "expires_at":4102444800u64
+            }).to_string())?;
+            std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))?;
+            let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+            let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+                .args(["serve", "--no-monitor", "--port", &port.to_string()])
+                .env("CCP_CONFIG_DIR", directory.path())
+                .env("XDG_STATE_HOME", directory.path().join("state"))
+                .env("CCP_ANTIGRAVITY_ENABLED", enabled)
+                .env(
+                    "CCP_ANTIGRAVITY_USER_AGENT",
+                    std::ffi::OsString::from_vec(invalid),
+                )
+                .env("CCP_CURSOR_CLIENT_VERSION", "synthetic-version")
+                .env("CCP_LOG_STDERR", "1")
+                .env("CCP_LOG_VERBOSE", "1")
+                .env("CCP_TRAFFIC_LOG", "1")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let mut child = ChildGuard(child);
+            drop(wait_for_service(&mut child, port)?);
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                .build()?;
+            let response = client
+                .get(format!(
+                    "http://127.0.0.1:{port}/v1/models?include_capabilities=true"
+                ))
+                .send()
+                .await?;
+            assert_eq!(response.status(), 200);
+            let models: serde_json::Value = response.json().await?;
+            assert!(!models["data"].as_array().unwrap().iter().any(|entry| {
+                entry["id"]
+                    .as_str()
+                    .is_some_and(|name| name.starts_with("antigravity/"))
+            }));
+            let capability = &models["capabilities"]["providers"]["antigravity"];
+            assert_eq!(capability["status"]["configuration"], "invalid");
+            assert_eq!(capability["status"]["configuration_ready"], false);
+            assert_eq!(capability["enabled"], false);
+            // A network-free other-provider operation must reach traffic setup,
+            // not merely the early rejection of an unavailable native model.
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
+                .json(&serde_json::json!({
+                    "model": "kimi-for-coding",
+                    "messages": [{"role": "user", "content": "synthetic"}]
+                }))
+                .send()
+                .await?;
+            assert_eq!(response.status(), 200);
+            let count: serde_json::Value = response.json().await?;
+            assert!(
+                count["input_tokens"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            );
+            assert!(
+                directory
+                    .path()
+                    .join("state/claude-code-proxy/traffic")
+                    .exists()
+            );
+            let response = client.post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .json(&serde_json::json!({"model":"antigravity/gemini-4-argon-low", "max_tokens":32, "messages":[{"role":"user","content":"synthetic"}]}))
+                .send().await?;
+            assert!(response.status().is_client_error());
+            assert!(!response.text().await?.contains("sentinel"));
+            assert!(
+                matches!(upstream.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            send_signal(&child, "-TERM")?;
+            assert!(wait_for_exit(&mut child, Duration::from_secs(5))?.success());
+            let mut stderr = String::new();
+            child.0.stderr.take().unwrap().read_to_string(&mut stderr)?;
+            assert!(!stderr.contains("sentinel"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

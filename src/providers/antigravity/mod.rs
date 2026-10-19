@@ -105,6 +105,7 @@ impl AntigravityProvider {
                 .post(endpoint)
                 .bearer_auth(&credential.access_token)
                 .header("accept", "text/event-stream")
+                .headers(auth.config.native_headers())
                 .json(&prepared.wire)
                 .send(),
         )

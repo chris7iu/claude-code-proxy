@@ -97,7 +97,19 @@ fn successful(parts: Value) -> String {
         json!({"response":{"candidates":[{"content":{"role":"model","parts":parts},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":1,"totalTokenCount":13}}}),
     )
 }
+pub(super) fn expected_native_user_agent() -> String {
+    format!("claude-code-proxy/{}", env!("CARGO_PKG_VERSION"))
+}
+
 async fn provider(directory: &Path, url: &url::Url) -> AntigravityProvider {
+    provider_with_user_agent(directory, url, None).await
+}
+
+async fn provider_with_user_agent(
+    directory: &Path,
+    url: &url::Url,
+    user_agent: Option<&str>,
+) -> AntigravityProvider {
     let store = Store::new(directory.join("antigravity/auth.json"));
     let lock = store.lock(Duration::from_secs(1)).await.unwrap();
     store
@@ -116,7 +128,14 @@ async fn provider(directory: &Path, url: &url::Url) -> AntigravityProvider {
     let config = Config {
         base_url: url.clone(),
         client_id: Some("synthetic-client".into()),
-        ..Config::default()
+        ..Config::read(&directory.join("config.json"), |key| {
+            if key == "CCP_ANTIGRAVITY_USER_AGENT" {
+                user_agent.map(Into::into)
+            } else {
+                None
+            }
+        })
+        .unwrap()
     };
     AntigravityProvider::with_auth(Auth::new(config, store).unwrap())
 }
@@ -144,6 +163,58 @@ fn client() -> reqwest::Client {
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap()
+}
+
+#[tokio::test]
+async fn antigravity_user_agent_generation_wire_matrix() {
+    for override_value in [
+        None,
+        Some("sentinel-native/9  (interior spaces preserved)"),
+        Some(
+            "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; cl=998863838; auth_method=consumer)",
+        ),
+    ] {
+        for stream in [false, true] {
+            let (upstream, captured) =
+                native(vec![(200, successful(json!([{"text":"ok"}])))]).await;
+            let directory = tempfile::tempdir().unwrap();
+            let monitor = MonitorHandle::new(10);
+            let proxy = proxy(
+                provider_with_user_agent(directory.path(), &upstream.url, override_value).await,
+                Some(monitor.clone()),
+            )
+            .await;
+            let response = client()
+                .post(proxy.url.join("/v1/messages").unwrap())
+                .header("user-agent", "hostile-frontend-UA")
+                .header("authorization", "Bearer frontend-credential")
+                .header("cookie", "private-frontend-cookie")
+                .header("x-goog-api-client", "frontend-metadata")
+                .json(&request(stream))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let text = response.text().await.unwrap();
+            assert!(!text.contains("sentinel-native"));
+            let captured = captured.lock().unwrap();
+            assert_eq!(captured.len(), 1);
+            let (headers, body) = &captured[0];
+            assert_eq!(headers.get_all("user-agent").iter().count(), 1);
+            assert_eq!(
+                headers["user-agent"],
+                override_value
+                    .map(str::to_owned)
+                    .unwrap_or_else(expected_native_user_agent)
+            );
+            assert_eq!(headers["authorization"], "Bearer proxy-owned-access");
+            assert!(!headers.contains_key("cookie"));
+            assert!(!headers.contains_key("x-goog-api-client"));
+            assert_eq!(body["userAgent"], "antigravity");
+            assert_eq!(body["requestType"], "agent");
+            assert!(!format!("{:?}", monitor.snapshot()).contains("sentinel-native"));
+        }
+    }
 }
 
 #[tokio::test]
@@ -189,7 +260,12 @@ async fn antigravity_http2_refused_stream_is_not_automatically_retried() {
         }
         attempts
     });
-    let client = Config::default()
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config::read(&directory.path().join("config.json"), |key| {
+        (key == "CCP_ANTIGRAVITY_USER_AGENT").then(|| "configured-no-retry-UA".into())
+    })
+    .unwrap();
+    let client = config
         .client_builder()
         .no_proxy()
         .http2_prior_knowledge()
@@ -198,6 +274,7 @@ async fn antigravity_http2_refused_stream_is_not_automatically_retried() {
     assert!(
         client
             .post(format!("http://{address}/v1internal:streamGenerateContent"))
+            .headers(config.native_headers())
             .json(&json!({"synthetic":"generation"}))
             .send()
             .await
@@ -308,7 +385,16 @@ async fn antigravity_http_preserves_preheader_errors_without_retry_or_secret_ech
         )])
         .await;
         let directory = tempfile::tempdir().unwrap();
-        let proxy = proxy(provider(directory.path(), &upstream.url).await, None).await;
+        let proxy = proxy(
+            provider_with_user_agent(
+                directory.path(),
+                &upstream.url,
+                Some("sentinel-no-retry-UA"),
+            )
+            .await,
+            None,
+        )
+        .await;
         let response = client()
             .post(proxy.url.join("/v1/messages").unwrap())
             .header("authorization", "Bearer frontend-secret")
@@ -319,14 +405,15 @@ async fn antigravity_http_preserves_preheader_errors_without_retry_or_secret_ech
             .unwrap();
         assert_eq!(response.status().as_u16(), status);
         assert_eq!(response.headers()["retry-after"], "7");
-        assert!(!response.text().await.unwrap().contains("private OAuth"));
+        let text = response.text().await.unwrap();
+        assert!(!text.contains("private OAuth"));
+        assert!(!text.contains("sentinel-no-retry-UA"));
         let captured = captured.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0["authorization"], "Bearer proxy-owned-access");
         assert!(!captured[0].0.contains_key("anthropic-beta"));
-        let identity = captured[0].0["user-agent"].to_str().unwrap();
-        assert!(identity.starts_with("claude-code-proxy/"));
-        assert!(identity.contains("Antigravity-compatible"));
+        assert_eq!(captured[0].0.get_all("user-agent").iter().count(), 1);
+        assert_eq!(captured[0].0["user-agent"], "sentinel-no-retry-UA");
     }
 }
 

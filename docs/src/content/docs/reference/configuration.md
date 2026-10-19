@@ -169,14 +169,56 @@ separate real-account OAuth/native smoke validation.
 | `CCP_ANTIGRAVITY_CLIENT_SECRET` | `antigravity.clientSecret` | unset | Optional public-client application secret, when required by that registered application. Not a user bearer token. |
 | `CCP_ANTIGRAVITY_PROJECT_ID` | `antigravity.projectId` | stored discovery result | Your authorized project; no borrowed project or automatic onboarding. |
 | `CCP_ANTIGRAVITY_BASE_URL` | `antigravity.baseUrl` | `https://cloudcode-pa.googleapis.com` | Explicit trusted HTTPS origin override. No userinfo, query, fragment, or path. Never automatically falls back to another endpoint. |
+| `CCP_ANTIGRAVITY_USER_AGENT` | `antigravity.userAgent` | `claude-code-proxy/<package version>` | Full HTTP User-Agent override for native generation and `loadCodeAssist` only. OAuth token exchange/refresh always retain the default proxy identity. |
 
 Remote endpoints require HTTPS, redirects are never followed, and OAuth endpoints
 are fixed to `https://accounts.google.com/o/oauth2/v2/auth` and
 `https://oauth2.googleapis.com/token`. Plain loopback HTTP endpoints exist only as
-injected test fixtures, not environment/config options. The HTTP User-Agent
-identifies `claude-code-proxy` and its real platform as an Antigravity-compatible
-client. Product selectors `userAgent: antigravity` and `requestType: agent` do not
-claim an official CLI build or device identity.
+injected test fixtures, not environment/config options. By default every HTTP
+request sent by this adapter uses exactly `claude-code-proxy/<package version>`, with no
+platform suffix. A provider-specific User-Agent override replaces that header only
+on native generation (both streaming and nonstreaming frontend requests) and
+`loadCodeAssist` project discovery, never OAuth code exchange or refresh. Incoming
+client User-Agent, authorization and cookies are not forwarded. JSON product
+selectors `userAgent: antigravity` and `requestType: agent` are unchanged.
+
+Override precedence is `CCP_ANTIGRAVITY_USER_AGENT`, then `antigravity.userAgent`,
+then the proxy default. Neither `CCP_USER_AGENT` nor Codex settings are inherited.
+Presence selects the environment override even when empty; invalid values fail
+configuration rather than falling back, including while the provider is disabled.
+Invalid native configuration removes Antigravity readiness/advertisement; it does
+not disable other providers or prevent the proxy listener from starting. Auth
+status still exits successfully with a report of `configuration: invalid` and
+`configuration_ready: false`; report success does not establish readiness.
+The file field must be a string. The selected value must contain 1–4096 printable
+ASCII bytes (`0x20`–`0x7e`), with no leading/trailing space, tabs, control bytes or
+non-ASCII characters. Non-UTF8 environment values are rejected by the native
+validator even though this dedicated setting is excluded from legacy UTF-8
+snapshots. Unix key matching is exact; Windows covers ASCII case variants.
+Unrelated non-Unicode environment entries remain unsupported and fail with a
+fixed error, rather than being silently discarded. Valid bytes,
+including interior spacing, are preserved exactly: no trimming, suffix appending,
+version/changelist rewriting or platform substitution. Raw values are omitted from
+status/errors and marked sensitive in HTTP diagnostics. Do not put credentials in
+a User-Agent; it is sent to the configured trusted native API origin.
+
+An explicit compatibility override may use this pinned historical value:
+
+```text
+antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; cl=998863838; auth_method=consumer)
+```
+
+Set it as the full provider-specific environment or file value only when desired;
+it is **not the default** and does not enable the provider. These literal platform
+and consumer-profile tokens are caller-selected compatibility metadata, not a
+claim about the host or a verified account classification. They are not normalized
+to the host. The pinned public reference records CLI 1.3.5 generation on
+Darwin/arm64 and uses the same formatter for project discovery. Exact CLI 1.4.2
+identification, current official-client equivalence, live acceptance and provider
+policy/terms compatibility remain unverified. No runtime `agy` probing, credential
+import, device identity or attestation fabrication is performed. User-Agent is not
+authentication or evidence of entitlement; see the
+[reference evidence](/reference/compatibility-and-limitations/#evidence-and-remaining-gates).
 
 Login requests explicit browser consent, offline access, PKCE S256, independent
 one-time state, and an ephemeral `127.0.0.1` callback. The reference-protocol scopes
@@ -190,7 +232,7 @@ Only `CCP_CONFIG_DIR/antigravity/auth.json` is used. Atomic private writes use m
 coordinates login/logout/refresh across processes; logout never removes that
 lock. Missing, invalid and unreadable storage remain distinct. Local logout resolves
 this exact store path independently of transport settings, so malformed JSON or
-an invalid API URL does not prevent deleting this provider's credential. It does
+an invalid API URL or User-Agent does not prevent deleting this provider's credential. It does
 not remove another provider's state.
 
 Refresh preserves the profile ID and retains the old refresh token when rotation

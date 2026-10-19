@@ -108,6 +108,9 @@ Run `claude-code-proxy models` for the current catalog or
 An additional **experimental, default-off native Antigravity Argon adapter** supports
 only `antigravity/gemini-4-argon-low`, `antigravity/gemini-4-argon-medium`, and
 `antigravity/gemini-4-argon-high`. It does not run or import credentials from `agy`.
+Its default HTTP User-Agent is `claude-code-proxy/<package version>`. An explicit
+provider-specific override affects only native generation/project discovery,
+not OAuth; it is compatibility metadata, not verified official-client identity.
 Use a fresh session for every model/tier/profile change. Real Google OAuth,
 entitlement, native tool round trips and all three tiers remain live-validation
 gates; offline tests are not evidence of account access. See the
