@@ -655,6 +655,249 @@ async fn antigravity_explicit_login_exchanges_pkce_and_saves_discovered_project(
 }
 
 #[tokio::test]
+async fn antigravity_manual_login_exchanges_once_with_fresh_pkce_and_exact_redirect() {
+    use base64::Engine;
+    use sha2::Digest;
+    let exchanges = Arc::new(std::sync::Mutex::new(Vec::<
+        std::collections::HashMap<String, String>,
+    >::new()));
+    let captured = exchanges.clone();
+    let server = Server::start(Router::new().route("/token", post(move |axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>| {
+        let captured = captured.clone();
+        async move {
+            captured.lock().unwrap().push(form);
+            Json(json!({"access_token":"manual-private-access", "refresh_token":"manual-private-refresh", "expires_in":3600}))
+        }
+    }))).await;
+    let directory = tempfile::tempdir().unwrap();
+    let auth = Auth::new(
+        Config {
+            token_url: server.url.join("/token").unwrap(),
+            client_id: Some("synthetic-public-client".into()),
+            project: Some("configured-project".into()),
+            ..Config::default()
+        },
+        Store::new(directory.path().join("auth.json")),
+    )
+    .unwrap();
+    let mut previous = None;
+    let mut previous_profile = None;
+    for full_url in [false, true] {
+        let mut issued = None;
+        auth.login_manual_with_completion(|url, state| {
+            let pairs = url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect::<std::collections::HashMap<_, _>>();
+            assert_eq!(
+                pairs["redirect_uri"],
+                "https://antigravity.google/oauth-callback"
+            );
+            assert_eq!(pairs["state"], state);
+            assert_eq!(pairs["code_challenge_method"], "S256");
+            issued = Some((state.clone(), pairs["code_challenge"].clone()));
+            let store = auth.store.clone();
+            async move {
+                // Consent must not retain the cross-process auth lock.
+                drop(store.lock(Duration::from_millis(50)).await.unwrap());
+                if full_url {
+                    let mut redirect =
+                        url::Url::parse("https://antigravity.google/oauth-callback").unwrap();
+                    redirect
+                        .query_pairs_mut()
+                        .extend_pairs([("state", state.as_str()), ("code", "4/0manual+secret=")]);
+                    Ok(redirect.to_string())
+                } else {
+                    Ok("4/0manual+secret=".to_string())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let issued = issued.unwrap();
+        if let Some(previous) = previous.as_ref() {
+            assert_ne!(&issued, previous);
+        }
+        let exchange = exchanges.lock().unwrap().last().unwrap().clone();
+        assert_eq!(exchange["code"], "4/0manual+secret=");
+        assert_eq!(
+            exchange["redirect_uri"],
+            "https://antigravity.google/oauth-callback"
+        );
+        assert_eq!(exchange["grant_type"], "authorization_code");
+        assert_eq!(
+            issued.1,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(sha2::Sha256::digest(exchange["code_verifier"].as_bytes()))
+        );
+        let credential = auth.store.load().unwrap().unwrap();
+        if let Some(previous) = previous_profile.as_ref() {
+            assert_ne!(&credential.profile_id, previous);
+        }
+        previous = Some(issued);
+        previous_profile = Some(credential.profile_id);
+    }
+    assert_eq!(exchanges.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn antigravity_manual_consent_epoch_changes_prevent_exchange() {
+    for logout in [false, true] {
+        let (_directory, _server, auth, state) = auth_fixture(true).await;
+        let visited = Arc::new(AtomicUsize::new(0));
+        let entered = visited.clone();
+        let result = auth
+            .login_manual_with_completion(|_, _| async {
+                entered.fetch_add(1, Ordering::SeqCst);
+                if logout {
+                    auth.logout().await.unwrap();
+                } else {
+                    let mut lock = auth.store.lock(Duration::from_millis(50)).await.unwrap();
+                    lock.advance().unwrap();
+                    let mut new = expired();
+                    new.profile_id = "newer-profile".into();
+                    auth.store.save(&lock, &new).unwrap();
+                }
+                Ok("4/0stale-code".into())
+            })
+            .await;
+        assert_eq!(visited.load(Ordering::SeqCst), 1);
+        assert!(result.is_err());
+        assert_eq!(state.count.load(Ordering::SeqCst), 0);
+        if logout {
+            assert!(auth.store.load().unwrap().is_none());
+        } else {
+            assert_eq!(
+                auth.store.load().unwrap().unwrap().profile_id,
+                "newer-profile"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn antigravity_manual_invalid_completion_never_exchanges_or_mutates_credentials() {
+    for input in [
+        "",
+        "code=secret",
+        "https:/invalid",
+        "https://antigravity.google/oauth-callback?state=wrong&code=secret",
+    ] {
+        let (_directory, _server, auth, state) = auth_fixture(true).await;
+        let before = auth.store.load().unwrap().unwrap();
+        let result = auth
+            .login_manual_with_completion(|_, _| async { Ok(input.to_owned()) })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(state.count.load(Ordering::SeqCst), 0);
+        assert!(auth.store.load().unwrap().unwrap() == before);
+    }
+}
+
+#[tokio::test]
+async fn antigravity_manual_foreign_or_unbound_code_is_not_retried_or_saved() {
+    // This fake AS enforces the required PKCE/downgrade policy. It does NOT
+    // establish that Google's live AS enforces either property for this client.
+    for code in ["foreign-attempt-code", "code-issued-without-challenge"] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        let server = Server::start(Router::new().route(
+            "/token",
+            post(
+                move |axum::extract::Form(form): axum::extract::Form<
+                    std::collections::HashMap<String, String>,
+                >| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(form["code"], code);
+                        assert!(!form["code_verifier"].is_empty());
+                        (
+                            http::StatusCode::BAD_REQUEST,
+                            "sentinel-private-token-error",
+                        )
+                    }
+                },
+            ),
+        ))
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("auth.json"));
+        let before = expired();
+        saved(&store, &before).await;
+        let auth = Auth::new(
+            Config {
+                token_url: server.url.join("/token").unwrap(),
+                client_id: Some("public-client".into()),
+                project: Some("project".into()),
+                ..Config::default()
+            },
+            store,
+        )
+        .unwrap();
+        let error = auth
+            .login_manual_with_completion(|_, _| async { Ok(code.to_owned()) })
+            .await
+            .unwrap_err();
+        assert!(!error.contains("sentinel"));
+        assert!(!error.contains(code));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(auth.store.load().unwrap().unwrap() == before);
+    }
+}
+
+#[tokio::test]
+async fn antigravity_manual_exchange_redirect_is_not_followed() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let sink = Server::start(Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            "unexpected"
+        }
+    }))
+    .await;
+    let destination = sink.url.to_string();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let server = Server::start(Router::new().route(
+        "/token",
+        post(move || {
+            let counter = counter.clone();
+            let location = destination.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                (
+                    http::StatusCode::TEMPORARY_REDIRECT,
+                    [("location", location)],
+                    "private response",
+                )
+            }
+        }),
+    ))
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let auth = Auth::new(
+        Config {
+            token_url: server.url.join("/token").unwrap(),
+            client_id: Some("public-client".into()),
+            ..Config::default()
+        },
+        Store::new(directory.path().join("auth.json")),
+    )
+    .unwrap();
+    assert!(
+        auth.login_manual_with_completion(|_, _| async { Ok("4/0private-code".into()) })
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert!(auth.store.load().unwrap().is_none());
+}
+
+#[tokio::test]
 async fn antigravity_logout_during_browser_consent_prevents_exchange_and_resurrection() {
     let (_directory, _server, auth, state) = auth_fixture(true).await;
     let mut callback = None;

@@ -88,7 +88,13 @@ enum AntigravityGroup {
 
 #[derive(Debug, Subcommand)]
 enum AntigravityAuth {
-    Login,
+    Login {
+        /// Experimental Unix terminal paste-back; requires hosted-redirect client registration.
+        /// Copy the code displayed by the browser page. Cancel on browser errors
+        /// (including redirect_uri_mismatch) or no displayed code; no automatic fallback.
+        #[arg(long)]
+        manual: bool,
+    },
     Device,
     Status {
         #[arg(long)]
@@ -215,7 +221,10 @@ fn main() -> Result<()> {
         } => {
             let handlers = claude_code_proxy::providers::antigravity::cli_handlers();
             match command {
-                AntigravityAuth::Login => handlers.login(),
+                AntigravityAuth::Login { manual: false } => handlers.login(),
+                AntigravityAuth::Login { manual: true } => {
+                    claude_code_proxy::providers::antigravity::login_manual()
+                }
                 AntigravityAuth::Device => handlers.device(),
                 AntigravityAuth::Logout => handlers.logout(),
                 AntigravityAuth::Status { json: true } => {
@@ -451,6 +460,27 @@ mod tests {
     #[test]
     fn non_tty_stdout_selects_plain_mode() {
         assert_eq!(select_serve_mode(false, false), ServeMode::Plain);
+    }
+
+    #[test]
+    fn antigravity_manual_login_is_an_explicit_provider_only_option() {
+        let manual = Cli::try_parse_from([
+            "claude-code-proxy",
+            "antigravity",
+            "auth",
+            "login",
+            "--manual",
+        ]);
+        assert!(manual.is_ok(), "manual login must be a supported opt-in");
+        assert!(
+            Cli::try_parse_from(["claude-code-proxy", "antigravity", "auth", "login",]).is_ok()
+        );
+        for provider in ["codex", "kimi", "cursor", "grok"] {
+            assert!(
+                Cli::try_parse_from(["claude-code-proxy", provider, "auth", "login", "--manual",])
+                    .is_err()
+            );
+        }
     }
 
     #[test]

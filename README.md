@@ -118,6 +118,16 @@ gates; offline tests are not evidence of account access. See the
 and [configuration](docs/src/content/docs/reference/configuration.md#experimental-antigravity)
 before explicitly enabling it. Existing provider defaults and aliases are unchanged.
 
+Antigravity login defaults to automatic browser/loopback completion. On Unix,
+`claude-code-proxy antigravity auth login --manual` instead prints a browser URL
+and accepts the **code displayed by the completion page** through hidden input in
+your local foreground terminal. It does not open a browser or callback listener.
+The explicitly configured OAuth client must permit
+`https://antigravity.google/oauth-callback`; a loopback-only client may not work.
+Cancel on browser errors or no displayed code; there is no automatic fallback.
+Never paste a code/token into chat, shell arguments or logs. See the configuration
+reference for PKCE/state distinctions, terminal bounds and unverified live gates.
+
 > [!WARNING]
 > The proxy accepts local requests without client authentication. It binds to
 > `127.0.0.1` by default. Protect any non-loopback listener with a firewall or

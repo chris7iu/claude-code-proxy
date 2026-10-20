@@ -212,6 +212,365 @@ fn antigravity_user_agent_non_utf8_logout_still_deletes_only_local_credentials()
 }
 
 #[test]
+fn antigravity_manual_help_and_nonterminal_refusal() {
+    let directory = TempDir::new().unwrap();
+    let help = Command::cargo_bin("claude-code-proxy")
+        .unwrap()
+        .args(["antigravity", "auth", "login", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("--manual"));
+    assert!(help.contains("experimental") || help.contains("Experimental"));
+    let output = Command::cargo_bin("claude-code-proxy")
+        .unwrap()
+        .args(["antigravity", "auth", "login", "--manual"])
+        .env("CCP_CONFIG_DIR", directory.path())
+        .env("CCP_ANTIGRAVITY_CLIENT_ID", "synthetic-public-client")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    #[cfg(unix)]
+    assert!(diagnostics.contains("terminal"), "{diagnostics}");
+    #[cfg(not(unix))]
+    assert!(diagnostics.contains("unsupported"), "{diagnostics}");
+    assert!(!diagnostics.contains("accounts.google.com"));
+    assert!(!directory.path().join("antigravity").exists());
+}
+
+#[cfg(unix)]
+mod manual_terminal_cli {
+    use super::*;
+    use std::{
+        fs::File,
+        os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::process::CommandExt,
+        },
+        process::Command as ProcessCommand,
+    };
+
+    const HELPER: &str = "manual_terminal_cli::antigravity_manual_cli_background_helper";
+
+    #[test]
+    fn antigravity_manual_cli_background_helper() {
+        if std::env::var_os("CCP_TEST_MANUAL_CLI_BACKGROUND").is_none() {
+            return;
+        }
+        let status = ProcessCommand::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+            .args(["antigravity", "auth", "login", "--manual"])
+            .process_group(0)
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        println!("background-cli-refused");
+    }
+
+    fn mode(fd: libc::c_int) -> libc::termios {
+        let mut value = std::mem::MaybeUninit::uninit();
+        assert_eq!(unsafe { libc::tcgetattr(fd, value.as_mut_ptr()) }, 0);
+        unsafe { value.assume_init() }
+    }
+
+    struct UnreadOutput {
+        child: ChildGuard,
+        _master: File,
+        slave: File,
+        before: libc::termios,
+        home: TempDir,
+    }
+    impl UnreadOutput {
+        fn start(invalid_configuration: bool) -> Self {
+            use std::{
+                ffi::CStr,
+                os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+            };
+            let home = TempDir::new().unwrap();
+            let (mut master, mut slave) = (-1, -1);
+            let mut name = [0 as libc::c_char; libc::PATH_MAX as usize];
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        name.as_mut_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            let master = unsafe { File::from_raw_fd(master) };
+            let slave = unsafe { File::from_raw_fd(slave) };
+            for file in [&master, &slave] {
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            // A separate open file description fills this owned PTY. Never set
+            // O_NONBLOCK on the stdio descriptions inherited by the real CLI:
+            // doing so would hide Rust main's blocking-stderr regression.
+            let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+            let mut filler = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+                .open(std::ffi::OsStr::from_bytes(name.to_bytes()))
+                .unwrap();
+            let mut full = false;
+            for _ in 0..128 {
+                match filler.write(&[b'x'; 1024]) {
+                    Ok(n) => assert!(n > 0),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        full = true;
+                        break;
+                    }
+                    Err(error) => panic!("could not fill private PTY: {error}"),
+                }
+            }
+            assert!(full, "fixture did not reach output backpressure");
+            drop(filler);
+            assert_eq!(
+                unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+                0
+            );
+            let before = mode(slave.as_raw_fd());
+            let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+            command
+                .args(["antigravity", "auth", "login", "--manual"])
+                .env_clear()
+                .env("HOME", home.path())
+                .env("CCP_CONFIG_DIR", home.path())
+                .env("XDG_STATE_HOME", home.path().join("state"))
+                .env("CCP_ANTIGRAVITY_CLIENT_ID", "synthetic-public-client")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave.try_clone().unwrap()));
+            if invalid_configuration {
+                command.env("CCP_ANTIGRAVITY_USER_AGENT", "invalid\tconfiguration");
+            }
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = ChildGuard(command.spawn().unwrap());
+            Self {
+                child,
+                _master: master,
+                slave,
+                before,
+                home,
+            }
+        }
+        fn wait_for_hidden_input(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while mode(self.slave.as_raw_fd()).c_lflag & libc::ECHO != 0 {
+                assert!(
+                    self.child.0.try_wait().unwrap().is_none(),
+                    "CLI exited before establishing terminal session"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "CLI did not enter hidden input mode"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn require_exit_without_drain(&mut self, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(status) = self.child.0.try_wait().unwrap() {
+                    assert_eq!(
+                        status.code(),
+                        Some(1),
+                        "manual failure must exit nonzero normally"
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "manual CLI failed to exit while PTY output remained unread"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            // There is deliberately NO master.read/collect, even after exit.
+            let after = mode(self.slave.as_raw_fd());
+            assert_eq!(before_mode(&self.before), before_mode(&after));
+            assert!(!self.home.path().join("antigravity/auth.json").exists());
+        }
+    }
+    fn before_mode(
+        mode: &libc::termios,
+    ) -> (
+        libc::tcflag_t,
+        libc::tcflag_t,
+        libc::tcflag_t,
+        libc::tcflag_t,
+        [libc::cc_t; libc::NCCS],
+    ) {
+        (
+            mode.c_iflag,
+            mode.c_oflag,
+            mode.c_cflag,
+            mode.c_lflag,
+            mode.c_cc,
+        )
+    }
+
+    #[test]
+    fn antigravity_manual_cli_unread_output_cancellation_exits() {
+        for signal in ["-INT", "-TERM"] {
+            let mut child = UnreadOutput::start(false);
+            child.wait_for_hidden_input();
+            send_signal(&child.child, signal).unwrap();
+            child.require_exit_without_drain(Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn antigravity_manual_cli_unread_output_configuration_error_exits() {
+        let mut child = UnreadOutput::start(true);
+        child.require_exit_without_drain(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn antigravity_manual_cli_unread_output_real_deadline_exits() {
+        let mut child = UnreadOutput::start(false);
+        child.wait_for_hidden_input();
+        // Intentionally use the REAL production deadline. No test-only timeout
+        // switch exists in the shipped command, and no PTY output is drained.
+        child.require_exit_without_drain(Duration::from_secs(185));
+    }
+
+    #[test]
+    fn antigravity_manual_cli_real_terminal_cancellation_and_background_refusal() {
+        for background in [false, true] {
+            let home = TempDir::new().unwrap();
+            let (mut master, mut slave) = (-1, -1);
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            let mut master = unsafe { File::from_raw_fd(master) };
+            let slave = unsafe { File::from_raw_fd(slave) };
+            for file in [&master, &slave] {
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(
+                unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            let before = mode(slave.as_raw_fd());
+            let mut command = if background {
+                let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
+                command.args([HELPER, "--exact", "--nocapture"]);
+                command
+            } else {
+                let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+                command.args(["antigravity", "auth", "login", "--manual"]);
+                command
+            };
+            command
+                .env_clear()
+                .env("HOME", home.path())
+                .env("CCP_CONFIG_DIR", home.path())
+                .env("XDG_STATE_HOME", home.path().join("state"))
+                .env("CCP_ANTIGRAVITY_CLIENT_ID", "synthetic-public-client")
+                .env("CCP_TEST_MANUAL_CLI_BACKGROUND", "1")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(slave.try_clone().unwrap()))
+                .stderr(Stdio::from(slave.try_clone().unwrap()));
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = ChildGuard(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut output = Vec::new();
+            let mut cancelled = false;
+            loop {
+                let mut buffer = [0u8; 4096];
+                match master.read(&mut buffer) {
+                    Ok(n) => output.extend_from_slice(&buffer[..n]),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(libc::EIO) => {}
+                    Err(error) => panic!("PTY read failed: {error}"),
+                }
+                let text = String::from_utf8_lossy(&output);
+                if !background
+                    && !cancelled
+                    && text.contains("Paste the displayed authorization code")
+                {
+                    assert_eq!(mode(slave.as_raw_fd()).c_lflag & libc::ECHO, 0);
+                    send_signal(&child, "-TERM").unwrap();
+                    cancelled = true;
+                }
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    // Consume the bounded final diagnostic after process exit.
+                    loop {
+                        match master.read(&mut buffer) {
+                            Ok(n) if n > 0 => output.extend_from_slice(&buffer[..n]),
+                            _ => break,
+                        }
+                    }
+                    assert_eq!(status.success(), background);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "real manual CLI failed to exit");
+                thread::sleep(Duration::from_millis(5));
+            }
+            let output = String::from_utf8_lossy(&output);
+            if background {
+                assert!(
+                    output.contains("foreground controlling terminal"),
+                    "{output}"
+                );
+                assert!(!output.contains("accounts.google.com"));
+                assert!(!home.path().join("antigravity").exists());
+            } else {
+                assert!(cancelled);
+                assert!(output.contains("Manual OAuth login cancelled"), "{output}");
+                assert!(output.contains("CODE DISPLAYED"));
+                assert!(!home.path().join("antigravity/auth.json").exists());
+            }
+            let after = mode(slave.as_raw_fd());
+            assert_eq!(before.c_iflag, after.c_iflag);
+            assert_eq!(before.c_oflag, after.c_oflag);
+            assert_eq!(before.c_cflag, after.c_cflag);
+            assert_eq!(before.c_lflag, after.c_lflag);
+            assert_eq!(before.c_cc, after.c_cc);
+        }
+    }
+}
+
+#[test]
 fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
     cmd.args(["models", "--full"]);

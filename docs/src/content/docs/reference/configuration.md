@@ -220,12 +220,79 @@ import, device identity or attestation fabrication is performed. User-Agent is n
 authentication or evidence of entitlement; see the
 [reference evidence](/reference/compatibility-and-limitations/#evidence-and-remaining-gates).
 
-Login requests explicit browser consent, offline access, PKCE S256, independent
-one-time state, and an ephemeral `127.0.0.1` callback. The reference-protocol scopes
+Login requests explicit browser consent, offline access, PKCE S256 and independent
+one-time state. By default it opens a browser and uses an ephemeral `127.0.0.1`
+callback. The reference-protocol scopes
 are `https://www.googleapis.com/auth/` followed by `cloud-platform`, `userinfo.email`,
 `userinfo.profile`, `cclog`, and `experimentsandconfigs`. These are reference
 compatibility scopes, not independently proven minimal scopes. No `agy`, Gemini,
 Codex, keychain or other application's credentials are discovered or imported.
+
+**Experimental manual completion:** `antigravity auth login --manual` prints the
+authorization URL and waits for a private terminal paste instead of opening a
+browser/listener. It uses `https://antigravity.google/oauth-callback` in both the
+authorization request and code exchange. Your explicitly configured client must
+allow that exact hosted redirect; an installed-app/loopback-only registration may
+not. No client ID/secret is bundled or substituted, scopes are unchanged, and no
+Google OOB redirect, device flow or automatic fallback is attempted. If the browser
+reports `redirect_uri_mismatch`, another error, or no code, cancel and correct the
+registration; ordinary callback login remains a separately chosen alternative.
+
+Choose the intended account in the browser, then copy the **displayed code**, not
+the final address bar. A query-free public inspection on 2026-10-20 found that the
+hosted page reads/URL-decodes `code`, removes it from browser history, and displays
+and copies that same bare value without adding state or a signed envelope. This
+confirms the page's display contract, not successful OAuth or current official-CLI
+parser equivalence. Historical hosted-redirect evidence is
+https://github.com/google-antigravity/antigravity-cli/issues/315; official
+paste-back UX is documented at https://www.antigravity.google/docs/cli/install/.
+
+Each attempt keeps a fresh verifier private and sends an independent state and
+S256 challenge. A **bare code has no returned state to validate**: its binding to
+this attempt relies on the authorization server enforcing S256 PKCE, including
+rejecting a verifier-bearing exchange for a code issued without a challenge
+(downgrade prevention). Those server properties and acceptance of the configured
+client/redirect remain live-unverified. A complete redirect URL is also accepted
+if obtained with its code intact; it must match the hosted HTTPS target and path,
+have exactly one matching state and one valid code, and contain no userinfo,
+fragment, conflicting error, duplicate security fields or malformed encoding.
+A valid state-bound denial produces a fixed error. URL-looking malformed input
+never falls back to bare-code acceptance. Bare codes are not percent/base64/JSON
+decoded; surrounding spaces, controls, non-ASCII and URL/structured delimiters
+are rejected rather than normalized. Slash/plus/dot/tilde/padding code bytes are
+preserved and form-encoded once for the single token request.
+
+Manual input is **Unix-only**, verified at runtime on Linux. It requires terminal
+stdin and a foreground controlling terminal. A separately opened nonblocking
+`/dev/tty` owns hidden input and bounded prompt/URL output; ordinary pipes are not
+supported and no input is echoed or placed in argv/log/status. The input cap is
+8192 bytes; the absolute 180-second input/output deadline also covers continuous
+input and partial pastes. Three empty entries may reprompt without resetting that
+deadline; the fourth fails. Enter submits, Backspace edits, and Ctrl-C/Ctrl-D,
+Ctrl-Z/Ctrl-backslash or SIGINT/SIGTERM cancel. Exact bracketed-paste delimiters
+are recognized without enabling terminal modes; malformed/nested escapes fail.
+
+Before exchange, successful explicit cleanup discards **currently queued** terminal
+input and restores the exact saved mode using immediate, non-draining termios
+calls. If flushing fails, mode restoration is still attempted, but queued-input
+disposal cannot be guaranteed; any cleanup error prevents exchange. Controlled
+cancellation and unwinding also attempt restoration; SIGKILL, abort or unrecoverable
+crashes cannot guarantee restoration. Input arriving after cleanup/process exit
+cannot be disposed of by a finished process: stop pasting when cancelled. Never
+paste credentials into chat,
+shell commands or recorded transcripts. Login releases the auth lock during
+consent, then rechecks its epoch before one exchange; logout/new login invalidates
+stale consent. There is no token-exchange retry or partial-credential save. Once
+credentials are durably saved, login is successful even if the bounded,
+best-effort terminal confirmation cannot be shown or is interrupted.
+
+Once a foreground terminal session has been acquired, failure diagnostics also
+use that owned nonblocking terminal, with a separate absolute two-second budget
+after runtime cleanup. A blocked/closed terminal may prevent the diagnostic from
+being shown, but the command still exits nonzero without falling back to a
+blocking stderr write. Early non-terminal/background/unsupported-platform
+refusals retain ordinary CLI error reporting; their stderr is outside this
+interactive-session deadline contract.
 
 Only `CCP_CONFIG_DIR/antigravity/auth.json` is used. Atomic private writes use mode
 0600 on Unix, under a mode-0700 provider directory. A stable sibling `auth.lock`

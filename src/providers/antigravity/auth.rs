@@ -216,6 +216,14 @@ pub(crate) fn now() -> u64 {
         .as_secs()
 }
 
+pub(crate) const LOGIN_SAVED: &str = "Antigravity credentials saved. Experimental native access and model entitlement are NOT verified; start a fresh fixed-model session.";
+
+struct LoginAttempt {
+    epoch: String,
+    verifier: String,
+    state: String,
+}
+
 pub(crate) struct Auth {
     pub store: Store,
     pub config: Config,
@@ -247,6 +255,46 @@ impl Auth {
     pub async fn logout(&self) -> Result<()> {
         self.store.logout().await
     }
+    #[cfg(any(unix, test))]
+    pub(crate) async fn login_manual_with_completion<F, Fut>(&self, complete: F) -> Result<()>
+    where
+        F: FnOnce(url::Url, String) -> Fut,
+        Fut: std::future::Future<Output = Result<String>>,
+    {
+        let attempt = self.begin_login().await?;
+        let redirect = super::manual::REDIRECT;
+        let authorization = authorization_url(
+            &self.config,
+            self.client_id()?,
+            redirect,
+            &attempt.state,
+            &attempt.verifier,
+        );
+        // Completion owns terminal cleanup. No network or persistence before it
+        // has successfully restored the terminal and returned a validated code.
+        let input = complete(authorization, attempt.state.clone()).await?;
+        let code = super::manual::parse_completion(&input, &attempt.state)?;
+        self.exchange(attempt, redirect, &code).await
+    }
+
+    fn client_id(&self) -> Result<&str> {
+        self.config
+            .client_id
+            .as_deref()
+            .ok_or("set CCP_ANTIGRAVITY_CLIENT_ID to your public installed-app OAuth client ID")
+    }
+
+    async fn begin_login(&self) -> Result<LoginAttempt> {
+        self.client_id()?;
+        let mut lock = self.store.lock(Duration::from_secs(10)).await?;
+        self.store.load()?;
+        Ok(LoginAttempt {
+            epoch: lock.epoch()?,
+            verifier: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+            state: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+        })
+    }
+
     pub async fn login(&self) -> Result<()> {
         self.login_with_opener(|authorization| {
             println!("Explicit browser consent for claude-code-proxy's experimental Antigravity adapter. No official CLI credentials are imported.\n{authorization}");
@@ -258,14 +306,7 @@ impl Auth {
         &self,
         opener: impl FnOnce(&url::Url) -> Result<()>,
     ) -> Result<()> {
-        let client_id =
-            self.config.client_id.as_deref().ok_or(
-                "set CCP_ANTIGRAVITY_CLIENT_ID to your public installed-app OAuth client ID",
-            )?;
-        let mut lock = self.store.lock(Duration::from_secs(10)).await?;
-        self.store.load()?;
-        let epoch = lock.epoch()?;
-        drop(lock);
+        let attempt = self.begin_login().await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|_| "OAuth callback bind failed")?;
@@ -276,25 +317,36 @@ impl Auth {
                 .map_err(|_| "callback address unavailable")?
                 .port()
         );
-        let verifier = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-        let state = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
-        let authorization =
-            authorization_url(&self.config, client_id, &redirect, &state, &verifier);
+        let authorization = authorization_url(
+            &self.config,
+            self.client_id()?,
+            &redirect,
+            &attempt.state,
+            &attempt.verifier,
+        );
         opener(&authorization)?;
-        let code = tokio::time::timeout(Duration::from_secs(180), callback(listener, &state))
-            .await
-            .map_err(|_| "OAuth callback timed out")??;
+        let code =
+            tokio::time::timeout(Duration::from_secs(180), callback(listener, &attempt.state))
+                .await
+                .map_err(|_| "OAuth callback timed out")??;
+        self.exchange(attempt, &redirect, &code).await?;
+        println!("{LOGIN_SAVED}");
+        Ok(())
+    }
+
+    async fn exchange(&self, attempt: LoginAttempt, redirect: &str, code: &str) -> Result<()> {
+        let client_id = self.client_id()?;
         let mut lock = self.store.lock(Duration::from_secs(10)).await?;
-        if lock.epoch()? != epoch {
+        if lock.epoch()? != attempt.epoch {
             return Err("Antigravity login changed during consent; start login again");
         }
         self.store.load()?;
         let mut form = vec![
             ("grant_type", "authorization_code"),
             ("client_id", client_id),
-            ("redirect_uri", &redirect),
-            ("code", &code),
-            ("code_verifier", &verifier),
+            ("redirect_uri", redirect),
+            ("code", code),
+            ("code_verifier", &attempt.verifier),
         ];
         if let Some(secret) = self.config.client_secret.as_deref() {
             form.push(("client_secret", secret));
@@ -336,9 +388,6 @@ impl Auth {
         }
         lock.advance()?;
         self.store.save(&lock, &credential)?;
-        println!(
-            "Antigravity credentials saved. Experimental native access and model entitlement are NOT verified; start a fresh fixed-model session."
-        );
         Ok(())
     }
 }

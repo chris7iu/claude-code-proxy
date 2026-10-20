@@ -1,6 +1,8 @@
 //! Experimental, opt-in native Argon subscription transport.
 pub(crate) mod auth;
 pub(crate) mod config;
+#[cfg(any(unix, test))]
+mod manual;
 mod refresh;
 pub(crate) mod replay;
 pub(crate) mod request;
@@ -314,6 +316,23 @@ pub fn status_json() -> Value {
     value["schema_version"] = json!(1);
     value["provider"] = json!("antigravity");
     value
+}
+
+/// Explicit manual completion is separate from the shared provider CLI contract.
+pub fn login_manual() -> anyhow::Result<()> {
+    #[cfg(not(unix))]
+    anyhow::bail!("Antigravity manual login is unsupported on this platform; use auth login");
+    #[cfg(unix)]
+    {
+        match manual::terminal::run_cli().map_err(anyhow::Error::msg)? {
+            manual::terminal::CliOutcome::Success => Ok(()),
+            manual::terminal::CliOutcome::HandledFailure => {
+                // run_cli has dropped EVERY auth/runtime/terminal guard. Do not
+                // return Err: Rust main's stderr report can block on a full tty.
+                std::process::exit(1)
+            }
+        }
+    }
 }
 
 struct AntigravityCli;

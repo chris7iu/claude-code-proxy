@@ -70,7 +70,7 @@ claude-code-proxy <provider> auth <action>
 | `kimi` | Device code | Unsupported | User, expiry, scope, storage | Delete proxy credential |
 | `grok` | Browser PKCE | Device code | Expiry and storage | Delete proxy credential |
 | `cursor` | Browser polling flow | Unsupported | Source, claims, expiry | Delete proxy credential |
-| `antigravity` (experimental) | Explicit browser PKCE | Unsupported | Safe local readiness, optional `--json` | Delete only Antigravity credential |
+| `antigravity` (experimental) | Browser PKCE; opt-in Unix `--manual` paste-back | Unsupported | Safe local readiness, optional `--json` | Delete only Antigravity credential |
 
 Examples:
 
@@ -88,11 +88,33 @@ Antigravity auth commands work even while inference is disabled:
 ```sh
 claude-code-proxy antigravity auth status --json
 claude-code-proxy antigravity auth login
+claude-code-proxy antigravity auth login --manual
 claude-code-proxy antigravity auth logout
 ```
 
-Configure your installed-app client ID before explicit login; see
+Configure your explicit OAuth client ID before login; see
 [Antigravity configuration](/reference/configuration/#experimental-antigravity).
+Without `--manual`, browser opening and the ephemeral loopback callback are
+unchanged. Experimental `--manual` is Unix-only: it requires terminal stdin and a
+foreground controlling terminal, prints the authorization URL there, and opens
+neither a browser nor a callback listener. The configured client must permit the
+exact hosted redirect `https://antigravity.google/oauth-callback`.
+
+Open the URL in your browser, select the intended account, then copy the **code
+displayed by the completion page** into the hidden local terminal prompt. The
+page removes `code` from its address bar; copying that address afterward does not
+supply the code. Cancel if the browser reports an error (such as
+`redirect_uri_mismatch`) or displays no code. There is no automatic callback,
+client or endpoint fallback. Never put a code in command arguments, chat or logs.
+
+Input is limited to 8192 printable ASCII bytes and 180 seconds, with at most
+three empty-entry reprompts under the same deadline. Backspace edits; Enter
+submits; Ctrl-C/Ctrl-D cancel. Pipes and non-Unix manual mode are rejected before
+URL emission. Bare codes rely on server-enforced fresh S256 PKCE, **not returned
+state validation**; a complete redirect URL, if separately available with its
+code intact, additionally requires an exact matching state and redirect target.
+See configuration for security and terminal-restoration limitations.
+
 `status --json` is Antigravity-only and emits schema version 1, `provider:
 antigravity`, plus the safe provider descriptor documented under
 [model discovery](/reference/http-api/#get-v1models). A successfully emitted

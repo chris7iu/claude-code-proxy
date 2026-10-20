@@ -378,6 +378,7 @@ dependencies = [
  "hyper-util",
  "jiff",
  "jsonschema",
+ "libc",
  "once_cell",
  "predicates",
  "prost",

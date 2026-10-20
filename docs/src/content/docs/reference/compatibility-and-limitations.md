@@ -210,6 +210,9 @@ There are no automatic generation retries or endpoint/account fallback.
 | Requested output tokens | 1..65536 (8192 when omitted) |
 | Native header / body idle / whole collection deadline | 30s / 30s / 180s |
 | Auth lock acquisition / token-project request / browser callback | 10s / 30s / 180s |
+| Manual terminal input and prompt output / input bytes / empty reprompts | 180s absolute / 8192 bytes / 3; fourth empty entry fails |
+| Manual completion confirmation output | 2s absolute, best effort after durable success |
+| Established manual-session failure diagnostic | 2s absolute after runtime cleanup; nonzero exit even if output is blocked |
 | Callback headers / each preconnect read | 8 KiB / 2s |
 | Stored credential / OAuth-project response | 64 KiB each |
 
@@ -242,6 +245,18 @@ Google AI Ultra, but actual access responses remain authoritative. Automatic
 long-context compaction and native compaction acceptance are unverified. A
 manual real-client compact/resume fixture does not establish general compaction
 support.
+
+Opt-in `antigravity auth login --manual` uses the hosted redirect
+`https://antigravity.google/oauth-callback`, not Google OOB or a loopback listener.
+The hosted page displays/copies the decoded authorization code and removes it
+from its URL; copy the displayed code into the hidden local terminal, not chat or
+shell arguments. Client registration/redirect acceptance, token exchange, server
+S256 PKCE enforcement and rejection of PKCE downgrade remain live-validation
+gates. Bare-code input does not validate returned state; complete redirect-URL
+input does. No official-CLI parser or credential import is implied. Manual input
+is Unix-only (Linux runtime tests), refuses non-TTY/background use, and restores
+terminal mode on controlled exits but cannot guarantee restoration after SIGKILL,
+abort or a crash. See the [manual completion contract](/reference/configuration/#experimental-antigravity).
 
 The default HTTP User-Agent is exactly `claude-code-proxy/<package version>` on
 all Antigravity operations. An explicit `CCP_ANTIGRAVITY_USER_AGENT` or
