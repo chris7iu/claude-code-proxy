@@ -120,8 +120,12 @@ before explicitly enabling it. Existing provider defaults and aliases are unchan
 
 Antigravity login defaults to automatic browser/loopback completion. On Unix,
 `claude-code-proxy antigravity auth login --manual` instead prints a browser URL
-and accepts the **code displayed by the completion page** through hidden input in
-your local foreground terminal. It does not open a browser or callback listener.
+and accepts the **code displayed by the completion page** through visible input in
+your local foreground terminal. The code is sensitive: keep your screen,
+scrollback and recordings private. Short codes are fully visible; longer input
+shows its end with a `<` marker and total character count. A known terminal width
+of at least 10 columns is required; changing width cancels. It does not open a
+browser or callback listener.
 The explicitly configured OAuth client must permit
 `https://antigravity.google/oauth-callback`; a loopback-only client may not work.
 Cancel on browser errors or no displayed code; there is no automatic fallback.

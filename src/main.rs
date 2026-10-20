@@ -89,7 +89,9 @@ enum AntigravityGroup {
 #[derive(Debug, Subcommand)]
 enum AntigravityAuth {
     Login {
-        /// Experimental Unix terminal paste-back; requires hosted-redirect client registration.
+        /// Experimental Unix terminal paste-back with visible, sensitive input;
+        /// requires a known width of at least 10 columns and hosted-redirect client registration.
+        /// Long input shows its end and character count; changing terminal width cancels.
         /// Copy the code displayed by the browser page. Cancel on browser errors
         /// (including redirect_uri_mismatch) or no displayed code; no automatic fallback.
         #[arg(long)]

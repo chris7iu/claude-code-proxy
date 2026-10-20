@@ -101,8 +101,15 @@ neither a browser nor a callback listener. The configured client must permit the
 exact hosted redirect `https://antigravity.google/oauth-callback`.
 
 Open the URL in your browser, select the intended account, then copy the **code
-displayed by the completion page** into the hidden local terminal prompt. The
-page removes `code` from its address bar; copying that address afterward does not
+displayed by the completion page** into the visible local terminal prompt. The
+code is sensitive: keep screens, scrollback, screenshots and recordings private.
+The input row shows a character count; short codes fit in full, while `<` marks
+that only the end of longer input is visible. All entered characters remain part
+of the completion, up to the unchanged 8192-byte limit. A known terminal width of
+at least 10 columns is required; changing width cancels rather than risking
+incorrect wrapped editing. Output modes that translate carriage returns or letter
+case are refused, not silently changed.
+The page removes `code` from its address bar; copying that address afterward does not
 supply the code. Cancel if the browser reports an error (such as
 `redirect_uri_mismatch`) or displays no code. There is no automatic callback,
 client or endpoint fallback. Never put a code in command arguments, chat or logs.

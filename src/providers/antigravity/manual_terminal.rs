@@ -20,9 +20,13 @@ const CANCELLED: &str = "Manual OAuth login cancelled";
 const TIMED_OUT: &str = "Manual OAuth input timed out";
 const CLOSED: &str = "Manual OAuth terminal closed or unavailable";
 const RESTORE_FAILED: &str = "Manual OAuth terminal cleanup failed; no further exchange attempted";
+const WIDTH_REQUIRED: &str = "Manual OAuth terminal requires at least 10 columns";
+const RESIZED: &str = "Manual OAuth terminal width changed; login cancelled";
+const OUTPUT_TRANSLATES: &str =
+    "Manual OAuth terminal output must preserve carriage returns and letter case";
 const PROMPT: &[u8] =
-    b"\nPaste the displayed authorization code (hidden), then Enter; Ctrl-C cancels: ";
-const NOTICE: &[u8] = b"Experimental manual Antigravity login. Open this URL in your browser and choose the intended account.\nThe configured OAuth client must permit https://antigravity.google/oauth-callback.\nCopy the CODE DISPLAYED by the page, not the address bar (the page removes the code from its URL).\nCancel if the browser reports an error (including redirect_uri_mismatch) or shows no code.\nNo browser is opened automatically; no callback listener, credential import, or fallback is used.\n";
+    b"\nPaste the displayed authorization code (visible), then Enter; Ctrl-C cancels.\r\n";
+const NOTICE: &[u8] = b"Experimental manual Antigravity login. Open this URL in your browser and choose the intended account.\nThe configured OAuth client must permit https://antigravity.google/oauth-callback.\nCopy the CODE DISPLAYED by the page, not the address bar (the page removes the code from its URL).\nCancel if the browser reports an error (including redirect_uri_mismatch) or shows no code.\nNo browser is opened automatically; no callback listener, credential import, or fallback is used.\nWarning: the code is sensitive and VISIBLE; keep your screen, scrollback and recordings private.\nThe input row shows [character count]; < means only the end fits. Backspace edits; changing terminal width cancels.\n";
 
 pub(crate) enum CliOutcome {
     Success,
@@ -142,7 +146,7 @@ impl Terminal {
         // signal registrations may be used to drive this best-effort report.
         // The fd is our original independent O_NONBLOCK /dev/tty description.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let diagnostic = format!("\nError: {message}\n");
+        let diagnostic = format!("\r\nError: {message}\r\n");
         let mut bytes = diagnostic.as_bytes();
         let Ok(_mask) = TtouMask::block() else {
             return;
@@ -184,7 +188,7 @@ impl Terminal {
             }
         }
     }
-    fn hide_input(&mut self) -> Result<()> {
+    fn manage_input(&mut self) -> Result<()> {
         foreground(&self.file)?;
         let mut raw = self.saved;
         raw.c_iflag &= !(libc::IGNBRK
@@ -243,7 +247,11 @@ impl Terminal {
     async fn complete(&mut self, authorization: url::Url, timeout: Duration) -> Result<String> {
         let deadline = Instant::now() + timeout;
         let result = async {
-            self.hide_input()?;
+            self.validate_output()?;
+            if self.columns()? < 10 {
+                return Err(WIDTH_REQUIRED);
+            }
+            self.manage_input()?;
             self.output(NOTICE, deadline).await?;
             self.output(authorization.as_str().as_bytes(), deadline)
                 .await?;
@@ -257,7 +265,7 @@ impl Terminal {
     }
     async fn output(&mut self, mut bytes: &[u8], deadline: Instant) -> Result<()> {
         while !bytes.is_empty() {
-            self.ready(libc::POLLOUT, deadline).await?;
+            self.ready(libc::POLLOUT, deadline, None).await?;
             match self.file.write(bytes) {
                 Ok(0) => return Err(CLOSED),
                 Ok(n) => bytes = &bytes[n..],
@@ -267,34 +275,127 @@ impl Terminal {
         }
         Ok(())
     }
+    fn validate_output(&self) -> Result<()> {
+        let flags = self.saved.c_oflag;
+        if flags & libc::OPOST == 0 {
+            return Ok(()); // Translation flags are inert without postprocessing.
+        }
+        if flags & libc::OCRNL != 0 {
+            return Err(OUTPUT_TRANSLATES);
+        }
+        // Apple and BSDs other than OpenBSD do not expose OLCUC. Do not reject
+        // harmless output flags or silently normalize the caller's saved mode.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "openbsd",
+            target_os = "solaris",
+            target_os = "illumos",
+            target_os = "aix",
+            target_os = "haiku",
+            target_os = "hurd",
+            target_os = "nto",
+            target_os = "redox",
+            target_os = "emscripten",
+            target_os = "cygwin",
+            target_os = "fuchsia",
+            target_os = "l4re"
+        ))]
+        if flags & libc::OLCUC != 0 {
+            return Err(OUTPUT_TRANSLATES);
+        }
+        Ok(())
+    }
+    fn columns(&self) -> Result<u16> {
+        let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+        // SAFETY: owned live tty descriptor and writable winsize storage.
+        if unsafe { libc::ioctl(self.file.as_raw_fd(), libc::TIOCGWINSZ, size.as_mut_ptr()) } != 0 {
+            return Err(CLOSED);
+        }
+        Ok(unsafe { size.assume_init() }.ws_col)
+    }
     async fn input(&mut self, deadline: Instant) -> Result<String> {
+        let columns = self.columns()?;
+        if columns < 10 {
+            return Err(WIDTH_REQUIRED);
+        }
         let mut line = Line::new();
+        let mut frame = Frame::new();
+        let mut dirty = true;
+        let mut completion = None;
         let mut buffer = [0u8; 256];
         loop {
-            self.ready(libc::POLLIN, deadline).await?;
-            match self.file.read(&mut buffer) {
-                Ok(0) => return Err(CLOSED),
-                Ok(n) => {
-                    for byte in &buffer[..n] {
-                        if Instant::now() >= deadline {
-                            return Err(TIMED_OUT);
-                        }
-                        match line.feed(*byte)? {
-                            Input::Pending => (),
-                            Input::Empty => {
-                                self.output(b"\nEmpty input; paste the displayed code: ", deadline)
-                                    .await?
+            if frame.done() && dirty {
+                frame.render(&line, columns, completion.is_some());
+                dirty = false;
+            }
+            // Always service input, even when a frame cannot drain. In particular
+            // keyboard cancellation must not depend on output becoming writable.
+            let events = libc::POLLIN | if frame.done() { 0 } else { libc::POLLOUT };
+            let ready = self.ready(events, deadline, Some(columns)).await?;
+            if ready & libc::POLLIN != 0 {
+                match self.file.read(&mut buffer) {
+                    Ok(0) => return Err(CLOSED),
+                    Ok(n) => {
+                        for byte in &buffer[..n] {
+                            if Instant::now() >= deadline {
+                                return Err(TIMED_OUT);
                             }
-                            Input::Complete(code) => return Ok(code),
+                            if completion.is_some() {
+                                // Enter freezes the completion. Discard trailing
+                                // data; still honor cancellation during final output.
+                                if cancels(*byte) {
+                                    return Err(CANCELLED);
+                                }
+                                continue;
+                            }
+                            match line.feed(*byte)? {
+                                Input::Pending | Input::Empty => dirty = true,
+                                Input::Complete(code) => {
+                                    completion = Some(code);
+                                    dirty = true;
+                                    // Scan the rest only for cancellation, as above.
+                                }
+                            }
                         }
                     }
+                    Err(error) if retryable(&error) => (),
+                    Err(_) => return Err(CLOSED),
                 }
-                Err(error) if retryable(&error) => (),
-                Err(_) => return Err(CLOSED),
+            }
+            // One immutable in-flight frame, not an output queue. Edits arriving
+            // during a partial write are coalesced into the next latest snapshot.
+            if frame.done() && dirty {
+                frame.render(&line, columns, completion.is_some());
+                dirty = false;
+            }
+            if ready & libc::POLLOUT != 0 && !frame.done() {
+                if self.columns()? != columns {
+                    return Err(RESIZED);
+                }
+                if Instant::now() >= deadline {
+                    return Err(TIMED_OUT);
+                }
+                match self.file.write(&frame.bytes[frame.written..frame.len]) {
+                    Ok(0) => return Err(CLOSED),
+                    Ok(n) => frame.written += n,
+                    Err(error) if retryable(&error) => (),
+                    Err(_) => return Err(CLOSED),
+                }
+                if frame.done() && frame.final_frame {
+                    // Kernel acceptance of the final display/newline is required;
+                    // physical rendering by an external terminal is not observable.
+                    return completion.ok_or(INVALID);
+                }
             }
         }
     }
-    async fn ready(&self, events: libc::c_short, deadline: Instant) -> Result<()> {
+    async fn ready(
+        &self,
+        events: libc::c_short,
+        deadline: Instant,
+        columns: Option<u16>,
+    ) -> Result<libc::c_short> {
         loop {
             // A suspension on EVERY iteration gives signal delivery priority
             // even under a continuously readable/writable tty or EINTR storm.
@@ -304,6 +405,11 @@ impl Terminal {
                 return Err(TIMED_OUT);
             }
             foreground(&self.file)?;
+            if let Some(expected) = columns
+                && self.columns()? != expected
+            {
+                return Err(RESIZED);
+            }
             let mut descriptor = libc::pollfd {
                 fd: self.file.as_raw_fd(),
                 events,
@@ -321,7 +427,7 @@ impl Terminal {
                 return Err(CLOSED);
             }
             if descriptor.revents & events != 0 {
-                return Ok(());
+                return Ok(descriptor.revents);
             }
         }
     }
@@ -377,6 +483,58 @@ impl Drop for TtouMask {
     }
 }
 
+// A row never reaches the last terminal column, so erasure needs neither
+// cursor-up sequences nor assumptions about autowrap. Only accepted Line bytes
+// reach the display. Width changes cancel instead of trying to repair reflow.
+const MAX_VIEWPORT: usize = INPUT_LIMIT + 8;
+struct Frame {
+    bytes: [u8; 2 * MAX_VIEWPORT + 4],
+    len: usize,
+    written: usize,
+    final_frame: bool,
+}
+impl Frame {
+    fn new() -> Self {
+        Self {
+            bytes: [0; 2 * MAX_VIEWPORT + 4],
+            len: 0,
+            written: 0,
+            final_frame: false,
+        }
+    }
+    fn done(&self) -> bool {
+        self.written == self.len
+    }
+    fn render(&mut self, line: &Line, columns: u16, complete: bool) {
+        let width = usize::from(columns - 1).min(MAX_VIEWPORT);
+        self.bytes[..width + 2].fill(b' ');
+        self.bytes[0] = b'\r';
+        self.bytes[width + 1] = b'\r';
+        self.len = width + 2;
+        self.written = 0;
+        self.final_frame = complete;
+        let count = format!("[{}] ", line.len); // At most seven ASCII bytes.
+        self.append(count.as_bytes());
+        let mut available = width - count.len();
+        if line.len > available {
+            self.append(b"<");
+            available -= 1;
+        }
+        self.append(&line.bytes[line.len.saturating_sub(available)..line.len]);
+        if complete {
+            self.append(b"\r\n");
+        }
+    }
+    fn append(&mut self, bytes: &[u8]) {
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+}
+
+fn cancels(byte: u8) -> bool {
+    matches!(byte, 3 | 4 | 26 | 28)
+}
+
 enum Input {
     Pending,
     Empty,
@@ -400,7 +558,7 @@ impl Line {
         }
     }
     fn feed(&mut self, byte: u8) -> Result<Input> {
-        if matches!(byte, 3 | 4 | 26 | 28) {
+        if cancels(byte) {
             return Err(CANCELLED);
         }
         if self.escape != 0 {

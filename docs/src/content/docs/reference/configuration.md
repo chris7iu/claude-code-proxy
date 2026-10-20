@@ -229,7 +229,7 @@ compatibility scopes, not independently proven minimal scopes. No `agy`, Gemini,
 Codex, keychain or other application's credentials are discovered or imported.
 
 **Experimental manual completion:** `antigravity auth login --manual` prints the
-authorization URL and waits for a private terminal paste instead of opening a
+authorization URL and waits for a visible terminal paste instead of opening a
 browser/listener. It uses `https://antigravity.google/oauth-callback` in both the
 authorization request and code exchange. Your explicitly configured client must
 allow that exact hosted redirect; an installed-app/loopback-only registration may
@@ -263,14 +263,37 @@ are rejected rather than normalized. Slash/plus/dot/tilde/padding code bytes are
 preserved and form-encoded once for the single token request.
 
 Manual input is **Unix-only**, verified at runtime on Linux. It requires terminal
-stdin and a foreground controlling terminal. A separately opened nonblocking
-`/dev/tty` owns hidden input and bounded prompt/URL output; ordinary pipes are not
-supported and no input is echoed or placed in argv/log/status. The input cap is
-8192 bytes; the absolute 180-second input/output deadline also covers continuous
-input and partial pastes. Three empty entries may reprompt without resetting that
-deadline; the fourth fails. Enter submits, Backspace edits, and Ctrl-C/Ctrl-D,
-Ctrl-Z/Ctrl-backslash or SIGINT/SIGTERM cancel. Exact bracketed-paste delimiters
-are recognized without enabling terminal modes; malformed/nested escapes fail.
+stdin and a foreground controlling terminal with a known width of at least
+10 columns. A separately opened nonblocking `/dev/tty` owns input and bounded
+prompt/URL/visible-input output. Kernel echo stays disabled: only validated
+printable input is rendered by the application, never pasted escape sequences.
+Ordinary pipes are unsupported. Input is not copied to stdout, stderr, argv,
+logs or status; its intentional terminal display is **sensitive**, and may remain
+in scrollback, screenshots or recordings even after editing or cancellation.
+No scrollback erasure or exact current `agy` display equivalence is promised.
+
+The input occupies one bounded row, showing `[character count]` and the code.
+Short codes are fully visible. If longer input does not fit, `<` marks a visible
+tail viewport; the undisplayed prefix remains part of the completion. Backspace
+and Delete edit the complete logical input, not merely the displayed suffix.
+The final terminal column is reserved to avoid wrapping. A detected width change
+cancels without exchange rather than trying to repair terminal reflow. Output
+postprocessing that translates carriage returns (`OCRNL`) or letter case
+(`OLCUC`, where supported) is refused before displaying the authorization URL;
+these flags are harmless when `OPOST` is off. Normal `OPOST`/`ONLCR` output and
+other non-translating flags are preserved, and the saved mode is not normalized.
+
+The input cap is 8192 bytes; the absolute 180-second input/output deadline also
+covers visible redraws, blocked output, continuous input and partial pastes.
+Only one bounded display frame is pending; intermediate edits may be coalesced,
+not queued indefinitely. Three empty entries may redraw the empty prompt without
+resetting that deadline; the fourth fails. Enter submits, and Ctrl-C/Ctrl-D,
+Ctrl-Z/Ctrl-backslash or SIGINT/SIGTERM cancel, including during blocked redraws.
+Exact bracketed-paste delimiters are recognized without enabling terminal modes;
+malformed/nested escapes fail. Enter freezes the completion and ignores trailing
+code; its final display frame/newline must be accepted by the terminal device
+before cleanup and exchange. This cannot guarantee physical rendering by an
+external terminal.
 
 Before exchange, successful explicit cleanup discards **currently queued** terminal
 input and restores the exact saved mode using immediate, non-draining termios

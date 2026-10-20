@@ -210,7 +210,7 @@ There are no automatic generation retries or endpoint/account fallback.
 | Requested output tokens | 1..65536 (8192 when omitted) |
 | Native header / body idle / whole collection deadline | 30s / 30s / 180s |
 | Auth lock acquisition / token-project request / browser callback | 10s / 30s / 180s |
-| Manual terminal input and prompt output / input bytes / empty reprompts | 180s absolute / 8192 bytes / 3; fourth empty entry fails |
+| Manual terminal input, prompt and visible redraw output / input bytes / empty reprompts | 180s absolute / 8192 bytes / 3; fourth empty entry fails |
 | Manual completion confirmation output | 2s absolute, best effort after durable success |
 | Established manual-session failure diagnostic | 2s absolute after runtime cleanup; nonzero exit even if output is blocked |
 | Callback headers / each preconnect read | 8 KiB / 2s |
@@ -249,8 +249,14 @@ support.
 Opt-in `antigravity auth login --manual` uses the hosted redirect
 `https://antigravity.google/oauth-callback`, not Google OOB or a loopback listener.
 The hosted page displays/copies the decoded authorization code and removes it
-from its URL; copy the displayed code into the hidden local terminal, not chat or
-shell arguments. Client registration/redirect acceptance, token exchange, server
+from its URL; copy the displayed code into the visible local terminal, not chat or
+shell arguments. Input is sensitive and may remain in screen/scrollback recordings;
+application-managed visibility does not log it or promise erasure. Short codes
+are fully displayed; longer input shows its end with a `<` marker and total
+character count, not all 8192 bytes simultaneously. Known width of at least
+10 columns and non-translating output modes are required; detected width changes
+cancel without exchange. This is not verified current `agy` display parity.
+Client registration/redirect acceptance, token exchange, server
 S256 PKCE enforcement and rejection of PKCE downgrade remain live-validation
 gates. Bare-code input does not validate returned state; complete redirect-URL
 input does. No official-CLI parser or credential import is implied. Manual input

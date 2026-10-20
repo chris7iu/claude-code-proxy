@@ -223,6 +223,8 @@ fn antigravity_manual_help_and_nonterminal_refusal() {
     let help = String::from_utf8(help.stdout).unwrap();
     assert!(help.contains("--manual"));
     assert!(help.contains("experimental") || help.contains("Experimental"));
+    assert!(help.contains("visible"));
+    assert!(help.contains("10 columns"));
     let output = Command::cargo_bin("claude-code-proxy")
         .unwrap()
         .args(["antigravity", "auth", "login", "--manual"])
@@ -278,6 +280,19 @@ mod manual_terminal_cli {
         unsafe { value.assume_init() }
     }
 
+    fn set_columns(file: &File, columns: u16) {
+        let size = libc::winsize {
+            ws_row: 24,
+            ws_col: columns,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        assert_eq!(
+            unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+            0
+        );
+    }
+
     struct UnreadOutput {
         child: ChildGuard,
         _master: File,
@@ -308,6 +323,7 @@ mod manual_terminal_cli {
             );
             let master = unsafe { File::from_raw_fd(master) };
             let slave = unsafe { File::from_raw_fd(slave) };
+            set_columns(&slave, 80);
             for file in [&master, &slave] {
                 assert_eq!(
                     unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
@@ -372,7 +388,7 @@ mod manual_terminal_cli {
                 home,
             }
         }
-        fn wait_for_hidden_input(&mut self) {
+        fn wait_for_managed_input(&mut self) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while mode(self.slave.as_raw_fd()).c_lflag & libc::ECHO != 0 {
                 assert!(
@@ -381,7 +397,7 @@ mod manual_terminal_cli {
                 );
                 assert!(
                     Instant::now() < deadline,
-                    "CLI did not enter hidden input mode"
+                    "CLI did not enter application-managed input mode"
                 );
                 thread::sleep(Duration::from_millis(5));
             }
@@ -427,11 +443,373 @@ mod manual_terminal_cli {
         )
     }
 
+    // The shipped reqwest client must use child-only HTTPS_PROXY. This fake
+    // CONNECT endpoint never tunnels, resolves Google, performs TLS, or forwards
+    // a code. An accepted completion reaches it once; every refusal reaches it zero times.
+    struct ConnectProbe {
+        address: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+    impl ConnectProbe {
+        fn start() -> Self {
+            use std::sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, Ordering},
+            };
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stopped = stop.clone();
+            let captured = requests.clone();
+            let worker = thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(1)))
+                                .unwrap();
+                            stream
+                                .set_write_timeout(Some(Duration::from_secs(1)))
+                                .unwrap();
+                            let mut bytes = Vec::new();
+                            while !bytes.ends_with(b"\r\n\r\n") {
+                                let mut byte = [0];
+                                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                                    break;
+                                }
+                                bytes.push(byte[0]);
+                                assert!(bytes.len() <= 8192, "unbounded CONNECT request");
+                            }
+                            captured
+                                .lock()
+                                .unwrap()
+                                .push(String::from_utf8(bytes).unwrap());
+                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("fake proxy accept: {error}"),
+                    }
+                }
+            });
+            Self {
+                address,
+                stop,
+                requests,
+                worker: Some(worker),
+            }
+        }
+    }
+    impl Drop for ConnectProbe {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    struct VisibleCli {
+        child: ChildGuard,
+        master: File,
+        slave: File,
+        before: libc::termios,
+        output: Vec<u8>,
+        home: TempDir,
+        proxy: ConnectProbe,
+    }
+    impl VisibleCli {
+        fn start() -> Self {
+            Self::with_output_flag(0)
+        }
+        fn with_output_flag(flag: libc::tcflag_t) -> Self {
+            let proxy = ConnectProbe::start();
+            let home = TempDir::new().unwrap();
+            let (mut master, mut slave) = (-1, -1);
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                },
+                0
+            );
+            let master = unsafe { File::from_raw_fd(master) };
+            let slave = unsafe { File::from_raw_fd(slave) };
+            set_columns(&slave, 80);
+            for file in [&master, &slave] {
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+            }
+            let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+            assert_eq!(
+                unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+            let mut before = mode(slave.as_raw_fd());
+            if flag != 0 {
+                before.c_oflag |= libc::OPOST | flag;
+                assert_eq!(
+                    unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &before) },
+                    0
+                );
+            }
+            let mut command = ProcessCommand::new(env!("CARGO_BIN_EXE_claude-code-proxy"));
+            command
+                .args(["antigravity", "auth", "login", "--manual"])
+                .env_clear()
+                .env("HOME", home.path())
+                .env("CCP_CONFIG_DIR", home.path())
+                .env("XDG_STATE_HOME", home.path().join("state"))
+                .env("CCP_ANTIGRAVITY_CLIENT_ID", "synthetic-public-client")
+                .env("HTTPS_PROXY", format!("http://{}", proxy.address))
+                .env("NO_PROXY", "localhost,127.0.0.1,::1,[::1]")
+                .env("RUST_LOG", "trace")
+                .env("CCP_LOG_STDERR", "1")
+                .env("CCP_LOG_VERBOSE", "1")
+                .env("CCP_TRAFFIC_LOG", "1")
+                .stdin(Stdio::from(slave.try_clone().unwrap()))
+                .stdout(Stdio::from(
+                    File::create(home.path().join("stdout")).unwrap(),
+                ))
+                .stderr(Stdio::from(
+                    File::create(home.path().join("stderr")).unwrap(),
+                ));
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let child = ChildGuard(command.spawn().unwrap());
+            Self {
+                child,
+                master,
+                slave,
+                before,
+                output: Vec::new(),
+                home,
+                proxy,
+            }
+        }
+        fn collect(&mut self) {
+            let mut bytes = [0; 4096];
+            for _ in 0..16 {
+                match self.master.read(&mut bytes) {
+                    Ok(n) if n > 0 => self.output.extend_from_slice(&bytes[..n]),
+                    Ok(_) => break,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.raw_os_error() == Some(libc::EIO) =>
+                    {
+                        break;
+                    }
+                    Err(error) => panic!("visible CLI read: {error}"),
+                }
+            }
+            assert!(self.output.len() < 256 * 1024);
+        }
+        fn until(&mut self, needle: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                self.collect();
+                if String::from_utf8_lossy(&self.output).contains(needle) {
+                    return;
+                }
+                assert!(
+                    self.child.0.try_wait().unwrap().is_none(),
+                    "CLI exited before {needle}"
+                );
+                assert!(Instant::now() < deadline, "CLI did not display {needle}");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fn send(&mut self, input: &[u8]) {
+            assert_eq!(self.master.write(input).unwrap(), input.len());
+        }
+        fn block_output(&self) {
+            use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+            let mut name = [0 as libc::c_char; 4096];
+            assert_eq!(
+                unsafe { libc::ttyname_r(self.slave.as_raw_fd(), name.as_mut_ptr(), name.len()) },
+                0
+            );
+            let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+            let mut filler = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+                .open(std::ffi::OsStr::from_bytes(name.to_bytes()))
+                .unwrap();
+            for _ in 0..256 {
+                match filler.write(&[b'!'; 1024]) {
+                    Ok(n) => assert!(n > 0),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                    other => panic!("PTY fill failed: {other:?}"),
+                }
+            }
+            panic!("fixture did not reach output backpressure");
+        }
+        fn finish(&mut self, message: &str, connects: usize, sentinel: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                self.collect();
+                if let Some(status) = self.child.0.try_wait().unwrap() {
+                    assert_eq!(status.code(), Some(1));
+                    break;
+                }
+                assert!(Instant::now() < deadline, "CLI did not finish");
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.collect();
+            let text = String::from_utf8_lossy(&self.output);
+            assert!(text.contains(message), "{text}");
+            assert!(!text.contains("QUEUED_PRIVATE_TAIL"));
+            assert_eq!(
+                before_mode(&self.before),
+                before_mode(&mode(self.slave.as_raw_fd()))
+            );
+            let mut pending: libc::c_int = -1;
+            assert_eq!(
+                unsafe { libc::ioctl(self.slave.as_raw_fd(), libc::FIONREAD, &mut pending) },
+                0
+            );
+            assert_eq!(pending, 0);
+            for name in ["stdout", "stderr"] {
+                let log = std::fs::read_to_string(self.home.path().join(name)).unwrap();
+                assert!(!log.contains(sentinel), "redirected stream disclosed input");
+                assert!(!log.contains("QUEUED_PRIVATE_TAIL"));
+            }
+            assert!(!self.home.path().join("antigravity/auth.json").exists());
+            assert!(
+                !self
+                    .home
+                    .path()
+                    .join("state/claude-code-proxy/traffic")
+                    .exists()
+            );
+            let requests = self.proxy.requests.lock().unwrap();
+            assert_eq!(requests.len(), connects);
+            for request in requests.iter() {
+                assert_eq!(
+                    request.lines().next(),
+                    Some("CONNECT oauth2.googleapis.com:443 HTTP/1.1")
+                );
+                assert!(!request.contains(sentinel));
+                assert!(!request.contains("code_verifier"));
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_manual_cli_visible_before_enter_and_exact_https_proxy_boundary() {
+        let code = "4/0cli-visible-private";
+        for completion in ["submit", "ctrl-c", "invalid", "escape", "resize"] {
+            let mut child = VisibleCli::start();
+            child.until("Paste the displayed authorization code");
+            child.send(code.as_bytes());
+            child.until(&format!("[{}] {code}", code.len()));
+            assert_eq!(mode(child.slave.as_raw_fd()).c_lflag & libc::ECHO, 0);
+            assert!(String::from_utf8_lossy(&child.output).contains("sensitive"));
+            assert!(child.proxy.requests.lock().unwrap().is_empty());
+            let (message, connects) = match completion {
+                "submit" => {
+                    child.send(b"\r\nQUEUED_PRIVATE_TAIL\n");
+                    ("OAuth token exchange transport failed", 1)
+                }
+                "ctrl-c" => {
+                    child.send(b"\x03QUEUED_PRIVATE_TAIL\n");
+                    ("Manual OAuth login cancelled", 0)
+                }
+                "invalid" => {
+                    child.send(b"%\nQUEUED_PRIVATE_TAIL\n");
+                    ("Invalid OAuth completion", 0)
+                }
+                "escape" => {
+                    child.send(b"\x1b]52;c;injected\x07QUEUED_PRIVATE_TAIL\n");
+                    ("Invalid OAuth completion", 0)
+                }
+                _ => {
+                    set_columns(&child.slave, 40);
+                    ("Manual OAuth terminal width changed; login cancelled", 0)
+                }
+            };
+            child.finish(message, connects, code);
+        }
+    }
+
+    #[test]
+    fn antigravity_manual_cli_visible_output_translation_refuses_without_connect() {
+        let flags = [
+            libc::OCRNL,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            libc::OLCUC,
+        ];
+        for flag in flags {
+            let mut child = VisibleCli::with_output_flag(flag);
+            let message =
+                "Manual OAuth terminal output must preserve carriage returns and letter case";
+            child.finish(
+                if flag == libc::OCRNL {
+                    message
+                } else {
+                    "MANUAL OAUTH TERMINAL OUTPUT MUST PRESERVE CARRIAGE RETURNS AND LETTER CASE"
+                },
+                0,
+                "synthetic-code-not-entered",
+            );
+            assert!(
+                !String::from_utf8_lossy(&child.output)
+                    .to_lowercase()
+                    .contains("accounts.google.com")
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_manual_cli_visible_echo_backpressure_exits_without_drain_or_connect() {
+        let code = "4/0cli-blocked-private";
+        for cancellation in ["key", "signal", "resize"] {
+            let mut child = VisibleCli::start();
+            child.until("[0] ");
+            child.block_output();
+            child.send(code.as_bytes());
+            thread::sleep(Duration::from_millis(30));
+            match cancellation {
+                "key" => child.send(b"\x03QUEUED_PRIVATE_TAIL\n"),
+                "signal" => send_signal(&child.child, "-TERM").unwrap(),
+                _ => set_columns(&child.slave, 40),
+            }
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while child.child.0.try_wait().unwrap().is_none() {
+                assert!(
+                    Instant::now() < deadline,
+                    "blocked echo/diagnostic prevented CLI exit"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Diagnostic may be undeliverable; no output was drained to let it finish.
+            child.finish("", 0, code);
+        }
+    }
+
     #[test]
     fn antigravity_manual_cli_unread_output_cancellation_exits() {
         for signal in ["-INT", "-TERM"] {
             let mut child = UnreadOutput::start(false);
-            child.wait_for_hidden_input();
+            child.wait_for_managed_input();
             send_signal(&child.child, signal).unwrap();
             child.require_exit_without_drain(Duration::from_secs(5));
         }
@@ -446,7 +824,7 @@ mod manual_terminal_cli {
     #[test]
     fn antigravity_manual_cli_unread_output_real_deadline_exits() {
         let mut child = UnreadOutput::start(false);
-        child.wait_for_hidden_input();
+        child.wait_for_managed_input();
         // Intentionally use the REAL production deadline. No test-only timeout
         // switch exists in the shipped command, and no PTY output is drained.
         child.require_exit_without_drain(Duration::from_secs(185));
@@ -471,6 +849,7 @@ mod manual_terminal_cli {
             );
             let mut master = unsafe { File::from_raw_fd(master) };
             let slave = unsafe { File::from_raw_fd(slave) };
+            set_columns(&slave, 80);
             for file in [&master, &slave] {
                 assert_eq!(
                     unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
