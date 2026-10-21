@@ -101,8 +101,9 @@ impl AntigravityProvider {
             Ok(v) => v,
             Err(_) => return invalid("invalid native endpoint"),
         };
-        let sent = tokio::time::timeout(
-            Duration::from_secs(30),
+        let header_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let sent = tokio::time::timeout_at(
+            header_deadline,
             auth.client
                 .post(endpoint)
                 .bearer_auth(&credential.access_token)
@@ -117,28 +118,7 @@ impl AntigravityProvider {
             _ => return upstream_error("Antigravity native headers timed out or transport failed"),
         };
         if !upstream.status().is_success() {
-            let status = upstream.status();
-            let mut response = json_error(
-                status,
-                match status {
-                    StatusCode::UNAUTHORIZED => "authentication_error",
-                    StatusCode::FORBIDDEN => "permission_error",
-                    StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
-                    _ => "api_error",
-                },
-                format!(
-                    "Antigravity upstream returned HTTP {}; no retry or fallback attempted",
-                    status.as_u16()
-                ),
-            );
-            if let Some(value) = upstream
-                .headers()
-                .get("retry-after")
-                .filter(|v| v.as_bytes().len() <= 128)
-            {
-                response.headers_mut().insert("retry-after", value.clone());
-            }
-            return response;
+            return transport::http_error(upstream, header_deadline).await;
         }
         if !upstream
             .headers()

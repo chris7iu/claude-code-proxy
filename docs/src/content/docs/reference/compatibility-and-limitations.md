@@ -182,9 +182,42 @@ from traffic and error diagnostics.
 
 ### Transport, errors and bounds
 
-Native HTTP headers are awaited before downstream 200. Initial HTTP errors and
-`Retry-After` are preserved without exposing upstream error bodies. After native
-2xx the response body owns collection; no successful text/tool turn is published
+Native HTTP headers are awaited before downstream 200. Initial HTTP errors retain
+HTTP status and the Anthropic error envelope/type, including when SSE was requested.
+The generic message appends only fixed, allowlisted diagnostics in this order:
+`google_status`, `reason`, `domain`, `quota_failure`, `retry_hint`, `retry_s`.
+Unknown status/reason/domain values become `unclassified`; arbitrary upstream strings,
+messages, numeric error codes, metadata, project/account identifiers and replay data
+are never reflected or logged. Exact Google `ErrorInfo` reasons require an allowlisted
+domain; multiple ErrorInfo details are unclassified even if identical. A valid
+`QuotaFailure` is only `reported`, not proof that account subscription quota is
+exhausted. HTTP 429 and `RESOURCE_EXHAUSTED` alone cannot distinguish quota, rate or
+capacity limits. These supported literals are not a claim of live Argon acceptance.
+
+Diagnostic body collection requires complete EOF within 8 KiB and one absolute
+1-second deadline, further limited by the remaining 30-second header-request budget.
+JSON rejects duplicate keys, depth above 64, and more than 16 error details.
+Malformed, oversized, incomplete or timed-out bodies become unclassified without
+changing HTTP status. Unknown detail types are ignored; malformed detail structure
+invalidates body diagnostics. No diagnostic reader survives request cancellation.
+
+`Retry-After` is forwarded only after validating a single header as 1–5 decimal digits
+(0–86400 seconds, leading zeros normalized) or an exact canonical IMF-fixdate with
+valid calendar/weekday/GMT. Past dates imply zero wait; future dates beyond 24 hours
+are rejected, never shortened. RFC850/asctime dates, duplicate, signed, fractional,
+overlong or arbitrary header values are deliberately no longer forwarded.
+Google `RetryInfo.retryDelay` accepts a canonical nonnegative seconds string with up
+to nine fractional digits, rounded **up** using integer arithmetic, bounded to 86400
+seconds. It never synthesizes a `Retry-After` header. `retry_hint` is
+`valid`, `absent`, `invalid` or `conflicting`; `retry_s` is a bounded integer only for
+valid hints, otherwise `none`. Invalid hints take precedence; multiple RetryInfo
+objects conflict even when identical. Different valid header/body delta-seconds
+conflict; a valid HTTP-date plus valid body delay uses the larger remaining wait.
+A valid header is still forwarded if body hints conflict or are invalid. An unusable
+body cannot establish absent retry information, but a validated independent header
+remains usable. Retry hints are advisory only: there is no automatic sleep or retry.
+
+After native 2xx the response body owns collection; no successful text/tool turn is published
 until terminal state, arguments and replay metadata are validated. Late errors
 emit an SSE error without `message_stop` and record one failed monitor outcome.
 Dropping the body cancels owned inference work. Loopback socket tests cover

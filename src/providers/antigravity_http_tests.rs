@@ -51,6 +51,7 @@ type Captured = Arc<Mutex<Vec<(http::HeaderMap, Value)>>>;
 struct Backend {
     captured: Captured,
     replies: Vec<(u16, String)>,
+    headers: http::HeaderMap,
 }
 async fn backend(State(state): State<Arc<Backend>>, request: Request) -> Response {
     let headers = request.headers().clone();
@@ -68,18 +69,36 @@ async fn backend(State(state): State<Arc<Backend>>, request: Request) -> Respons
         .replies
         .get(index)
         .unwrap_or_else(|| state.replies.last().unwrap());
-    Response::builder()
+    let mut response = Response::builder()
         .status(*status)
-        .header("content-type", "text/event-stream")
-        .header("retry-after", "7")
         .body(Body::from(body.clone()))
-        .unwrap()
+        .unwrap();
+    *response.headers_mut() = state.headers.clone();
+    response
 }
 async fn native(replies: Vec<(u16, String)>) -> (Server, Captured) {
+    native_with_headers(
+        replies,
+        &[("content-type", "text/event-stream"), ("retry-after", "7")],
+    )
+    .await
+}
+async fn native_with_headers(
+    replies: Vec<(u16, String)>,
+    headers: &[(&str, &str)],
+) -> (Server, Captured) {
     let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut map = http::HeaderMap::new();
+    for (name, value) in headers {
+        map.append(
+            http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            http::HeaderValue::from_str(value).unwrap(),
+        );
+    }
     let state = Arc::new(Backend {
         captured: captured.clone(),
         replies,
+        headers: map,
     });
     let server = Server::start(
         Router::new()
@@ -628,6 +647,735 @@ async fn antigravity_real_disconnect_cancels_preheader_nonstream_and_stream_coll
         native_task.await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(monitor.snapshot().active.is_empty());
+    }
+}
+
+fn safe_suffix(
+    status: &str,
+    reason: &str,
+    domain: &str,
+    quota: &str,
+    hint: &str,
+    seconds: &str,
+) -> String {
+    format!(
+        "; google_status={status}; reason={reason}; domain={domain}; quota_failure={quota}; retry_hint={hint}; retry_s={seconds}"
+    )
+}
+fn error_info(reason: &str, domain: &str) -> Value {
+    json!({"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":reason,"domain":domain,"metadata":{"project":"DO_NOT_REFLECT_native_secret","email":"DO_NOT_REFLECT_native_secret@example.test"}})
+}
+fn retry_info(delay: Value) -> Value {
+    json!({"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":delay})
+}
+fn error_body(details: Value) -> String {
+    json!({"error":{"code":429,"message":"DO_NOT_REFLECT_native_secret","status":"RESOURCE_EXHAUSTED","details":details}}).to_string()
+}
+async fn assert_safe_error(
+    body: &str,
+    headers: &[(&str, &str)],
+    status: u16,
+    expected: (&str, Option<&str>),
+) {
+    for streaming in [false, true] {
+        let (upstream, captured) = native_with_headers(vec![(status, body.into())], headers).await;
+        let directory = tempfile::tempdir().unwrap();
+        let monitor = MonitorHandle::new(10);
+        let proxy = proxy(
+            provider(directory.path(), &upstream.url).await,
+            Some(monitor.clone()),
+        )
+        .await;
+        let response = client()
+            .post(proxy.url.join("/v1/messages").unwrap())
+            .json(&request(streaming))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        assert_eq!(response.headers()["x-antigravity-reasoning-tier"], "low");
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            expected.1
+        );
+        let text = response.text().await.unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        let kind = match status {
+            401 => "authentication_error",
+            403 => "permission_error",
+            429 => "rate_limit_error",
+            _ => "api_error",
+        };
+        assert_eq!(
+            value,
+            json!({"type":"error","error":{"type":kind,"message":format!("Antigravity upstream returned HTTP {status}; no retry or fallback attempted{}", expected.0)}})
+        );
+        assert!(!text.contains("DO_NOT_REFLECT_native_secret"));
+        assert!(!text.contains("message_start"));
+        assert!(!text.contains("message_stop"));
+        assert!(!text.contains("tool_use"));
+        assert!(!format!("{:?}", monitor.snapshot()).contains("DO_NOT_REFLECT_native_secret"));
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "one generation attempt only"
+        );
+    }
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_preserve_status_and_extract_only_allowed_fields() {
+    let body = error_body(json!([error_info("RATE_LIMIT_EXCEEDED", "googleapis.com"),
+        {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{"subject":"DO_NOT_REFLECT_native_secret","description":"DO_NOT_REFLECT_native_secret"}]},
+        {"@type":"DO_NOT_REFLECT_native_secret","message":"DO_NOT_REFLECT_native_secret"}]));
+    let suffix = safe_suffix(
+        "RESOURCE_EXHAUSTED",
+        "RATE_LIMIT_EXCEEDED",
+        "googleapis.com",
+        "reported",
+        "valid",
+        "7",
+    );
+    for status in [400, 401, 403, 404, 429, 500, 503] {
+        assert_safe_error(
+            &body,
+            &[("retry-after", "00007")],
+            status,
+            (&suffix, Some("7")),
+        )
+        .await;
+    }
+    assert_safe_error(
+        &error_body(json!([])),
+        &[],
+        429,
+        (
+            &safe_suffix(
+                "RESOURCE_EXHAUSTED",
+                "unclassified",
+                "unclassified",
+                "absent",
+                "absent",
+                "none",
+            ),
+            None,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_unknown_ambiguous_and_quota_details_fail_closed() {
+    for (details, reason, domain, quota) in [
+        (
+            json!([error_info(
+                "MODEL_CAPACITY_EXHAUSTED",
+                "cloudcode-pa.googleapis.com"
+            )]),
+            "MODEL_CAPACITY_EXHAUSTED",
+            "cloudcode-pa.googleapis.com",
+            "absent",
+        ),
+        (
+            json!([error_info(
+                "DO_NOT_REFLECT_native_secret_CAPACITY",
+                "googleapis.com"
+            )]),
+            "unclassified",
+            "googleapis.com",
+            "absent",
+        ),
+        (
+            json!([error_info(
+                "RATE_LIMIT_EXCEEDED",
+                "DO_NOT_REFLECT_native_secret"
+            )]),
+            "unclassified",
+            "unclassified",
+            "absent",
+        ),
+        (
+            json!([
+                error_info("RATE_LIMIT_EXCEEDED", "googleapis.com"),
+                error_info("RATE_LIMIT_EXCEEDED", "googleapis.com")
+            ]),
+            "unclassified",
+            "unclassified",
+            "absent",
+        ),
+        (
+            json!([{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"googleapis.com","reason":42}]),
+            "unclassified",
+            "unclassified",
+            "absent",
+        ),
+        (
+            json!([{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[]}]),
+            "unclassified",
+            "unclassified",
+            "unclassified",
+        ),
+        (
+            json!([{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":["DO_NOT_REFLECT_native_secret"]}]),
+            "unclassified",
+            "unclassified",
+            "unclassified",
+        ),
+        (
+            json!([{"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{}]}, {"@type":"type.googleapis.com/google.rpc.QuotaFailure","violations":[{}]}]),
+            "unclassified",
+            "unclassified",
+            "unclassified",
+        ),
+    ] {
+        assert_safe_error(
+            &error_body(details),
+            &[],
+            429,
+            (
+                &safe_suffix(
+                    "RESOURCE_EXHAUSTED",
+                    reason,
+                    domain,
+                    quota,
+                    "absent",
+                    "none",
+                ),
+                None,
+            ),
+        )
+        .await;
+    }
+    for status in ["OK", "DO_NOT_REFLECT_native_secret", "resource_exhausted"] {
+        let body = json!({"error":{"status":status}}).to_string();
+        assert_safe_error(
+            &body,
+            &[],
+            429,
+            (
+                &safe_suffix(
+                    "unclassified",
+                    "unclassified",
+                    "unclassified",
+                    "absent",
+                    "absent",
+                    "none",
+                ),
+                None,
+            ),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_unusable_bodies_never_claim_no_retry_hint() {
+    let mut bodies = vec![
+        String::new(),
+        "DO_NOT_REFLECT_native_secret".into(),
+        "null".into(),
+        "{}".into(),
+        "{\"error\":{},\"error\":{}}".into(),
+        "{\"error\":{\"status\":\"UNKNOWN\",\"status\":\"INTERNAL\"}}".into(),
+        error_body(json!({})),
+        error_body(json!([{}])),
+        error_body(json!([{"@type":1}])),
+        error_body(json!([1])),
+        error_body(json!(vec![json!({"@type":"ignored"}); 17])),
+        format!(
+            "{{\"error\":{{\"unused\":{}0{}}}}}",
+            "[".repeat(65),
+            "]".repeat(65)
+        ),
+        format!("{{\"error\":{{\"message\":\"{}\"}}}}", "x".repeat(8192)),
+    ];
+    bodies.push(format!("{} trailing", error_body(json!([]))));
+    for body in bodies {
+        for (headers, hint, seconds, forwarded) in [
+            (vec![], "invalid", "none", None),
+            (vec![("retry-after", "7")], "valid", "7", Some("7")),
+        ] {
+            assert_safe_error(
+                &body,
+                &headers,
+                503,
+                (
+                    &safe_suffix(
+                        "unclassified",
+                        "unclassified",
+                        "unclassified",
+                        "unclassified",
+                        hint,
+                        seconds,
+                    ),
+                    forwarded,
+                ),
+            )
+            .await;
+        }
+    }
+    let body = "{\"error\":{}}";
+    let padded = format!("{body}{}", " ".repeat(8192 - body.len()));
+    assert_safe_error(
+        &padded,
+        &[],
+        400,
+        (
+            &safe_suffix(
+                "unclassified",
+                "unclassified",
+                "unclassified",
+                "absent",
+                "absent",
+                "none",
+            ),
+            None,
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_retry_truth_table_and_header_only_forwarding() {
+    // Header and RetryInfo are independent: never invent an HTTP header from the body.
+    for (headers, details, hint, seconds, forwarded) in [
+        (vec![], json!([]), "absent", "none", None),
+        (vec![], json!([retry_info(json!("7s"))]), "valid", "7", None),
+        (
+            vec![],
+            json!([retry_info(json!("0.000000001s"))]),
+            "valid",
+            "1",
+            None,
+        ),
+        (
+            vec![],
+            json!([retry_info(json!("7.250s"))]),
+            "valid",
+            "8",
+            None,
+        ),
+        (
+            vec![],
+            json!([retry_info(json!("86400.000000000s"))]),
+            "valid",
+            "86400",
+            None,
+        ),
+        (
+            vec![("retry-after", "7")],
+            json!([retry_info(json!("7s"))]),
+            "valid",
+            "7",
+            Some("7"),
+        ),
+        (
+            vec![("retry-after", "7")],
+            json!([retry_info(json!("8s"))]),
+            "conflicting",
+            "none",
+            Some("7"),
+        ),
+        (
+            vec![("retry-after", "7")],
+            json!([retry_info(json!("bad"))]),
+            "invalid",
+            "none",
+            Some("7"),
+        ),
+        (
+            vec![("retry-after", "DO_NOT_REFLECT_native_secret")],
+            json!([retry_info(json!("7s"))]),
+            "invalid",
+            "none",
+            None,
+        ),
+        (
+            vec![("retry-after", "7"), ("retry-after", "7")],
+            json!([]),
+            "invalid",
+            "none",
+            None,
+        ),
+        (
+            vec![],
+            json!([retry_info(json!("7s")), retry_info(json!("7s"))]),
+            "conflicting",
+            "none",
+            None,
+        ),
+        (
+            vec![("retry-after", "7")],
+            json!([retry_info(json!("7s")), retry_info(json!("7s"))]),
+            "conflicting",
+            "none",
+            Some("7"),
+        ),
+        (
+            vec![],
+            json!([retry_info(json!("7s")), retry_info(json!("bad"))]),
+            "invalid",
+            "none",
+            None,
+        ),
+        (
+            vec![("retry-after", "Sun, 06 Nov 1994 08:49:37 GMT")],
+            json!([retry_info(json!("7s"))]),
+            "valid",
+            "7",
+            Some("Sun, 06 Nov 1994 08:49:37 GMT"),
+        ),
+    ] {
+        assert_safe_error(
+            &error_body(details),
+            &headers,
+            429,
+            (
+                &safe_suffix(
+                    "RESOURCE_EXHAUSTED",
+                    "unclassified",
+                    "unclassified",
+                    "absent",
+                    hint,
+                    seconds,
+                ),
+                forwarded,
+            ),
+        )
+        .await;
+    }
+    for delay in [
+        json!("-1s"),
+        json!("+1s"),
+        json!("01s"),
+        json!("1e2s"),
+        json!("1.s"),
+        json!(".1s"),
+        json!("1.0000000001s"),
+        json!("86400.000000001s"),
+        json!("86401s"),
+        json!("100000s"),
+        json!(" 1s"),
+        json!(1),
+        json!(null),
+        json!({"seconds":1,"nanos":0}),
+    ] {
+        assert_safe_error(
+            &error_body(json!([retry_info(delay)])),
+            &[],
+            429,
+            (
+                &safe_suffix(
+                    "RESOURCE_EXHAUSTED",
+                    "unclassified",
+                    "unclassified",
+                    "absent",
+                    "invalid",
+                    "none",
+                ),
+                None,
+            ),
+        )
+        .await;
+    }
+    for header in [
+        "",
+        "-1",
+        "+1",
+        "1.0",
+        "1e2",
+        "86401",
+        "000000",
+        "7, 7",
+        "Mon, 06 Nov 1994 08:49:37 GMT",
+        "Sun, 31 Feb 2024 08:49:37 GMT",
+        "Sunday, 06-Nov-94 08:49:37 GMT",
+        "Sun Nov  6 08:49:37 1994",
+        "Sun, 06 Nov 1994 08:49:37 UTC",
+        "Fri, 31 Dec 9999 23:59:59 GMT",
+        "DO_NOT_REFLECT_native_secret",
+    ] {
+        assert_safe_error(
+            &error_body(json!([])),
+            &[("retry-after", header)],
+            429,
+            (
+                &safe_suffix(
+                    "RESOURCE_EXHAUSTED",
+                    "unclassified",
+                    "unclassified",
+                    "absent",
+                    "invalid",
+                    "none",
+                ),
+                None,
+            ),
+        )
+        .await;
+    }
+    for header in ["0", "86400"] {
+        assert_safe_error(
+            &error_body(json!([])),
+            &[("retry-after", header)],
+            429,
+            (
+                &safe_suffix(
+                    "RESOURCE_EXHAUSTED",
+                    "unclassified",
+                    "unclassified",
+                    "absent",
+                    "valid",
+                    header,
+                ),
+                Some(header),
+            ),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_chunked_overflow_trickle_and_read_failure_are_bounded() {
+    for streaming in [false, true] {
+        for mode in [
+            "trickle",
+            "overflow",
+            "known_oversize",
+            "disconnect",
+            "utf8",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url =
+                url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let task = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                if mode == "known_oversize" {
+                    socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 8193\r\nConnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                }
+                match mode {
+                    "overflow" => {
+                        let body = format!("2001\r\n{}\r\n", "x".repeat(8193));
+                        let _ = socket.write_all(body.as_bytes()).await;
+                    }
+                    "trickle" => {
+                        for _ in 0..40 {
+                            if socket.write_all(b"1\r\n \r\n").await.is_err() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                    "disconnect" => {
+                        return;
+                    }
+                    "utf8" => {
+                        let _ = socket.write_all(b"1\r\n\xff\r\n0\r\n\r\n").await;
+                    }
+                    _ => {}
+                }
+                let mut byte = [0u8; 1];
+                assert!(
+                    matches!(
+                        tokio::time::timeout(Duration::from_secs(2), socket.read(&mut byte)).await,
+                        Ok(Ok(0)) | Ok(Err(_))
+                    ),
+                    "error collector retained upstream socket: {mode}"
+                );
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err(),
+                    "unexpected second native request"
+                );
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let proxy = proxy(provider(directory.path(), &url).await, None).await;
+            let started = tokio::time::Instant::now();
+            let response = client()
+                .post(proxy.url.join("/v1/messages").unwrap())
+                .json(&request(streaming))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 429);
+            let value: Value = response.json().await.unwrap();
+            assert!(
+                value["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(&safe_suffix(
+                        "unclassified",
+                        "unclassified",
+                        "unclassified",
+                        "unclassified",
+                        "invalid",
+                        "none"
+                    ))
+            );
+            assert!(started.elapsed() < Duration::from_millis(1800));
+            if mode == "trickle" {
+                assert!(started.elapsed() >= Duration::from_millis(800));
+            }
+            task.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_downstream_disconnect_cancels_body_read() {
+    for streaming in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = url::Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            ready_tx.send(()).unwrap();
+            let mut byte = [0u8; 1];
+            assert!(
+                matches!(
+                    tokio::time::timeout(Duration::from_millis(700), socket.read(&mut byte)).await,
+                    Ok(Ok(0)) | Ok(Err(_))
+                ),
+                "body read must cancel before its one-second timeout"
+            );
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let proxy = proxy(provider(directory.path(), &url).await, None).await;
+        let mut downstream =
+            tokio::net::TcpStream::connect(("127.0.0.1", proxy.url.port().unwrap()))
+                .await
+                .unwrap();
+        let body = request(streaming).to_string();
+        downstream.write_all(format!("POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        ready_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(downstream);
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_reuse_remaining_header_budget() {
+    for remaining in [Duration::ZERO, Duration::from_millis(100)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0u8; 1];
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_millis(700), socket.read(&mut byte)).await,
+                Ok(Ok(0)) | Ok(Err(_))
+            ));
+        });
+        let upstream = client()
+            .post(format!("http://{address}/"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let response = super::antigravity::transport::http_error(upstream, start + remaining).await;
+        assert_eq!(response.status(), 503);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "must not grant a fresh second after header budget"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&bytes)
+                .unwrap()
+                .contains("retry_hint=invalid; retry_s=none")
+        );
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn antigravity_safe_errors_verbose_log_redaction() {
+    const CHILD: &str = "CCP_SAFE_ERROR_LOG_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert!(crate::config::log_verbose());
+        assert!(crate::config::log_stderr());
+        assert_safe_error(
+            &error_body(json!([error_info(
+                "DO_NOT_REFLECT_native_secret",
+                "DO_NOT_REFLECT_native_secret"
+            )])),
+            &[("retry-after", "DO_NOT_REFLECT_native_secret")],
+            429,
+            (
+                &safe_suffix(
+                    "RESOURCE_EXHAUSTED",
+                    "unclassified",
+                    "unclassified",
+                    "absent",
+                    "invalid",
+                    "none",
+                ),
+                None,
+            ),
+        )
+        .await;
+        return;
+    }
+    // Isolate logger configuration from parallel tests. RUST_LOG does not configure this logger.
+    let directory = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "providers::antigravity_http_tests::antigravity_safe_errors_verbose_log_redaction",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env("CCP_LOG_VERBOSE", "1")
+        .env("CCP_LOG_STDERR", "1")
+        .env("CCP_CONFIG_DIR", directory.path().join("config"))
+        .env("XDG_STATE_HOME", directory.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "child must actually execute the test: {stdout}"
+    );
+    for bytes in [&output.stdout, &output.stderr] {
+        assert!(!String::from_utf8_lossy(bytes).contains("DO_NOT_REFLECT_native_secret"));
+    }
+    let logs = std::fs::read_to_string(directory.path().join("state/claude-code-proxy/proxy.log"))
+        .unwrap();
+    assert!(!logs.is_empty());
+    assert!(!logs.contains("DO_NOT_REFLECT_native_secret"));
+    let captures: Vec<_> =
+        std::fs::read_dir(directory.path().join("state/claude-code-proxy/errors"))
+            .unwrap()
+            .collect();
+    assert!(!captures.is_empty());
+    for entry in captures {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        assert!(!text.contains("DO_NOT_REFLECT_native_secret"));
     }
 }
 
