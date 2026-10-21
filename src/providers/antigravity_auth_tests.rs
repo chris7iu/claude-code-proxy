@@ -446,6 +446,122 @@ async fn antigravity_logout_after_cancelled_refresh_waits_then_clears_without_re
 }
 
 #[tokio::test]
+async fn antigravity_refresh_connect_failure_retains_session_and_cools_down() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path().join("auth.json"));
+    saved(&store, &expired()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let config = Config {
+        token_url: format!("http://{address}/token").parse().unwrap(),
+        client_id: Some("synthetic-client".into()),
+        ..Config::default()
+    };
+    // A short budget cannot accommodate the second connection's 16s reserve.
+    let auth = Auth::new(config, store)
+        .unwrap()
+        .with_refresh_timeouts(Duration::from_secs(1), Duration::from_secs(2));
+    let error = auth.access().await.err().expect("closed port must fail");
+    assert_eq!(
+        error.to_string(),
+        "Antigravity refresh connection failed before token submission; credentials retained"
+    );
+    assert_eq!(
+        auth.access()
+            .await
+            .err()
+            .expect("cooldown must fail")
+            .to_string(),
+        "Antigravity refresh connection retry temporarily deferred; credentials retained"
+    );
+    assert_eq!(
+        auth.store.load().unwrap().unwrap().refresh_token,
+        expired().refresh_token
+    );
+    auth.finish_maintenance().await.unwrap();
+}
+
+#[tokio::test]
+async fn antigravity_refresh_connect_http_errors_are_redacted_503_before_stream_headers() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::new(directory.path().join("auth.json"));
+    saved(&store, &expired()).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let generations = Arc::new(AtomicUsize::new(0));
+    let counter = generations.clone();
+    let upstream = Server::start(Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            "must not generate"
+        }
+    }))
+    .await;
+    let auth = Auth::new(
+        Config {
+            base_url: upstream.url.clone(),
+            token_url: format!("http://{address}/private-token-url")
+                .parse()
+                .unwrap(),
+            client_id: Some("private-client-id".into()),
+            client_secret: Some("private-client-secret".into()),
+            ..Config::default()
+        },
+        store.clone(),
+    )
+    .unwrap()
+    .with_refresh_timeouts(Duration::from_secs(1), Duration::from_secs(2));
+    let registry = crate::registry::Registry::from_providers(
+        crate::config::AliasProvider::Codex,
+        [
+            Arc::new(super::antigravity::AntigravityProvider::with_auth(auth))
+                as Arc<dyn crate::provider::Provider>,
+        ],
+    );
+    let proxy = Server::start(crate::server::app_with_features(
+        Arc::new(registry),
+        None,
+        crate::server::AppFeatures::default(),
+    ))
+    .await;
+    for stream in [false, true] {
+        let response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .post(proxy.url.join("/v1/messages").unwrap())
+            .json(&json!({"model":"antigravity/gemini-4-argon-low", "max_tokens":32, "stream":stream, "messages":[{"role":"user", "content":"hello"}]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 503);
+        assert!(!response.headers().contains_key("retry-after"));
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let error: Value = response.json().await.unwrap();
+        assert_eq!(error["error"]["type"], "api_error");
+        let rendered = error.to_string();
+        for sentinel in [
+            "private-token-url",
+            "private-client-id",
+            "private-client-secret",
+            "original-refresh",
+            "expired-access",
+            "127.0.0.1",
+        ] {
+            assert!(!rendered.contains(sentinel));
+        }
+    }
+    assert_eq!(generations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store.load().unwrap().unwrap().refresh_token,
+        expired().refresh_token
+    );
+}
+
+#[tokio::test]
 async fn antigravity_refresh_is_single_flight_and_preserves_profile_and_rotation() {
     for rotate in [false, true] {
         let (_directory, _server, auth, state) = auth_fixture(rotate).await;

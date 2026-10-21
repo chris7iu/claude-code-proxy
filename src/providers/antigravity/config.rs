@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use std::{ffi::OsString, path::Path};
 use url::Url;
 
+pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Clone)]
 pub(crate) struct Config {
     pub enabled: bool,
@@ -166,7 +168,7 @@ impl Config {
         reqwest::Client::builder()
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(CONNECT_TIMEOUT)
             .timeout(std::time::Duration::from_secs(180))
             .user_agent(default_user_agent())
     }

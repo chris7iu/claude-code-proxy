@@ -333,6 +333,39 @@ never starts or continues model generation. The 30-second network phase ends
 before validated replacement persistence. Filesystem writes are synchronous and
 are not claimed cancellable by that timer.
 
+Refresh alone permits at most **two application HTTP send attempts**, separated
+by 200 ms, under that same lock and original 30-second network deadline. The
+second attempt requires at least 16 seconds remaining after backoff (the existing
+15-second connection timeout plus a one-second response reserve). It is allowed
+only when the pinned Reqwest/Hyper error graph proves the OAuth POST was not sent
+and its first underlying I/O error is `ConnectionRefused` or `TimedOut`. The
+complete, bounded graph includes wrapped I/O causes; TLS verification/protocol
+errors, proxy authentication failures, unknown DNS errors and other unallowlisted
+causes are not retried. Reqwest's private connector-deadline error is also not on
+this I/O allowlist. A transport I/O timeout during TLS can qualify; there is no
+blanket timeout or TLS-phase retry rule. Redirects and Reqwest's own retry policy
+remain disabled. Hyper can internally reconnect an **unstarted** pooled request,
+so two send attempts do not imply a maximum of two socket connections.
+
+If every failed attempt is proven pre-send, credentials are retained without
+claiming an unknown rotation. A 30-second cooldown, scoped to the same profile,
+lock epoch and refresh token, prevents further foreground refreshes in this
+manager; after it expires, the next foreground request may start another bounded
+flight. No background retry is scheduled. Metadata-only edits do not reset the
+cooldown; a changed scope or successful persistence clears it. This bound is
+manager-local, not cross-process or crash-durable. Safe connection failures,
+cooldown and shutdown before a retry return a fixed, redacted HTTP 503 `api_error`
+without `Retry-After`, before streaming or nonstreaming generation headers. A
+shutdown detected before retry prevents the second send.
+
+An unresolved send, consumed request followed by connection loss, response/body
+failure, or timeout while a request might have been sent remains ambiguous and
+is **not retried**, including after a safe first failure. Those errors retain the
+existing HTTP 401 `authentication_error` and obsolete-token protection. No model
+generation or authorization-code exchange retries are added. These are this
+proxy's source-audited guarantees, not a claim about the official `agy` client's
+internal retry count or backoff.
+
 If persistence fails, the manager retains the replacement in memory, scoped to
 the profile, lock epoch and superseded refresh token, and reports a typed pending-
 persistence error. Subsequent requests retry the local write, not the obsolete

@@ -69,6 +69,9 @@ impl AntigravityProvider {
             Err(error) => {
                 return match error {
                     auth::AccessError::PendingPersistence
+                    | auth::AccessError::ConnectFailure
+                    | auth::AccessError::ConnectCooldown
+                    | auth::AccessError::StoppedBeforeSend
                     | auth::AccessError::Lock(_)
                     | auth::AccessError::Closed => json_error(
                         StatusCode::SERVICE_UNAVAILABLE,
