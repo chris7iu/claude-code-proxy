@@ -168,8 +168,16 @@ separate real-account OAuth/native smoke validation.
 | `CCP_ANTIGRAVITY_CLIENT_ID` | `antigravity.clientId` | unset | Your public installed-app OAuth client ID; required for login and refresh. |
 | `CCP_ANTIGRAVITY_CLIENT_SECRET` | `antigravity.clientSecret` | unset | Optional public-client application secret, when required by that registered application. Not a user bearer token. |
 | `CCP_ANTIGRAVITY_PROJECT_ID` | `antigravity.projectId` | stored discovery result | Your authorized project; no borrowed project or automatic onboarding. |
-| `CCP_ANTIGRAVITY_BASE_URL` | `antigravity.baseUrl` | `https://cloudcode-pa.googleapis.com` | Explicit trusted HTTPS origin override. No userinfo, query, fragment, or path. Never automatically falls back to another endpoint. |
+| `CCP_ANTIGRAVITY_BASE_URL` | `antigravity.baseUrl` | `https://daily-cloudcode-pa.googleapis.com` | Consumer OAuth native API origin. Explicit trusted HTTPS origin override; no userinfo, query, fragment, or path. Never automatically falls back to another endpoint. |
 | `CCP_ANTIGRAVITY_USER_AGENT` | `antigravity.userAgent` | `claude-code-proxy/<package version>` | Full HTTP User-Agent override for native generation and `loadCodeAssist` only. OAuth token exchange/refresh always retain the default proxy identity. |
+
+The built-in daily origin serves both `loadCodeAssist` project discovery and
+native generation for this adapter's supported consumer OAuth flow. Base URL
+precedence remains environment, config file, then default. Explicit production or
+custom trusted HTTPS origins remain unchanged; there is no hostname-based rewrite.
+The adapter does not implement GCP/ADC/service-account authentication or account-tier
+endpoint selection. This default is not a general Google Cloud routing policy; see
+[endpoint evidence](/reference/compatibility-and-limitations/#consumer-endpoint-evidence).
 
 Remote endpoints require HTTPS, redirects are never followed, and OAuth endpoints
 are fixed to `https://accounts.google.com/o/oauth2/v2/auth` and

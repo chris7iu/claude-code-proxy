@@ -266,6 +266,27 @@ copies. Overrides into Antigravity receive the same strict original-byte checks,
 including duplicate/per-message fields, raw context hints and every beta header.
 Cross-provider overrides out of explicit Antigravity routes remain blocked.
 
+### Consumer endpoint evidence
+
+The 2026-10-23–24 investigation observed an `agy` 1.4.6 consumer request using
+`https://daily-cloudcode-pa.googleapis.com`; static analysis also found that its
+consumer endpoint selector chooses daily. A controlled native comparison held the
+profile, model and request settings fixed and changed only the native API origin:
+production returned HTTP 429, daily returned HTTP 200 with a complete Anthropic
+text SSE turn, expected marker and valid usage, then production returned HTTP 429
+again. This supports the daily default for this adapter's supported consumer OAuth
+flow in that profile/time window, not a claim that every account or Google Cloud
+tier must use daily. HTTP 429 alone does not establish exhausted subscription quota.
+
+Both project discovery and generation use the selected native origin. Explicit
+`CCP_ANTIGRAVITY_BASE_URL` / `antigravity.baseUrl` overrides remain authoritative,
+including production and custom trusted HTTPS origins. GCP/ADC/service-account
+flows and account-tier endpoint selection are not implemented. No automatic
+endpoint fallback, hostname rewrite, OAuth endpoint change or replay-format change
+is introduced. Synthetic tests cover the complete nonstream assistant-content
+carrier and tool-result round trip; neither those tests nor the live low-tier text
+result establish all-tier or live tool/replay acceptance.
+
 ### Evidence and remaining gates
 
 Synthetic Rust HTTP/OAuth tests and an isolated real-client replay fixture do not

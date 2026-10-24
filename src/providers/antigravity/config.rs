@@ -41,7 +41,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_url: Url::parse("https://cloudcode-pa.googleapis.com").unwrap(),
+            base_url: Url::parse("https://daily-cloudcode-pa.googleapis.com").unwrap(),
             token_url: Url::parse("https://oauth2.googleapis.com/token").unwrap(),
             authorization_url: Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap(),
             client_id: None,
@@ -183,6 +183,98 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_consumer_default_origin_preserves_oauth_and_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let mut configurations = vec![Config::default(), Config::read(&path, |_| None).unwrap()];
+        std::fs::write(&path, br#"{"antigravity":{}}"#).unwrap();
+        configurations.push(Config::read(&path, |_| None).unwrap());
+        for config in configurations {
+            assert_eq!(
+                config.base_url.as_str(),
+                "https://daily-cloudcode-pa.googleapis.com/"
+            );
+            assert_eq!(
+                config.token_url.as_str(),
+                "https://oauth2.googleapis.com/token"
+            );
+            assert_eq!(
+                config.authorization_url.as_str(),
+                "https://accounts.google.com/o/oauth2/v2/auth"
+            );
+            assert_eq!(config.native_headers()["user-agent"], default_user_agent());
+            assert!(!config.enabled);
+        }
+    }
+
+    #[test]
+    fn antigravity_consumer_base_url_precedence_preserves_explicit_origins() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let daily = "https://daily-cloudcode-pa.googleapis.com";
+        let production = "https://cloudcode-pa.googleapis.com";
+        let custom = "https://cloudcode-pa.googleapis.com.example.invalid:8443";
+        for (file, environment, expected) in [
+            (None, None, daily),
+            (Some(production), None, production),
+            (Some(custom), None, custom),
+            (Some(daily), Some(production), production),
+            (Some(production), Some(custom), custom),
+            (Some(custom), Some(daily), daily),
+        ] {
+            let mut section = json!({});
+            if let Some(origin) = file {
+                section["baseUrl"] = json!(origin);
+            }
+            std::fs::write(&path, json!({"antigravity":section}).to_string()).unwrap();
+            let config = Config::read(&path, |key| {
+                if key == "CCP_ANTIGRAVITY_BASE_URL" {
+                    environment.map(OsString::from)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+            assert_eq!(config.base_url, Url::parse(expected).unwrap());
+        }
+    }
+
+    #[test]
+    fn antigravity_consumer_invalid_selected_origin_never_falls_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        for invalid in [
+            "",
+            "http://example.invalid",
+            "http://127.0.0.1:1234",
+            "https://user:secret@example.invalid",
+            "https://example.invalid/native",
+            "https://example.invalid/?query=value",
+            "https://example.invalid/#fragment",
+        ] {
+            std::fs::write(
+                &path,
+                br#"{"antigravity":{"baseUrl":"https://cloudcode-pa.googleapis.com"}}"#,
+            )
+            .unwrap();
+            assert!(
+                Config::read(&path, |key| {
+                    (key == "CCP_ANTIGRAVITY_BASE_URL").then(|| invalid.into())
+                })
+                .is_err()
+            );
+            std::fs::write(
+                &path,
+                json!({"antigravity":{"baseUrl":invalid}}).to_string(),
+            )
+            .unwrap();
+            assert!(Config::read(&path, |_| None).is_err());
+        }
+        std::fs::write(&path, br#"{"antigravity":{"authMethod":"gcp"}}"#).unwrap();
+        assert!(Config::read(&path, |_| None).is_err());
+    }
 
     #[test]
     fn antigravity_user_agent_file_setting_is_accepted_without_enabling_provider() {

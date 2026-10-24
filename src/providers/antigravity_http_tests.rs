@@ -185,6 +185,258 @@ fn client() -> reqwest::Client {
 }
 
 #[tokio::test]
+async fn antigravity_consumer_selected_origin_serves_discovery_and_generation() {
+    for stream in [false, true] {
+        let operations = Arc::new(Mutex::new(Vec::new()));
+        let token_operations = operations.clone();
+        let oauth = Server::start(Router::new().route("/token", post(move |axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>| {
+            let operations = token_operations.clone();
+            async move {
+                assert_eq!(form["grant_type"], "authorization_code");
+                operations.lock().unwrap().push("token");
+                axum::Json(json!({"access_token":"synthetic-access","refresh_token":"synthetic-refresh","expires_in":3600}))
+            }
+        }))).await;
+        let captured: Captured = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(Backend {
+            captured: captured.clone(),
+            replies: vec![(200, successful(json!([{"text":"selected origin"}])))],
+            headers: http::HeaderMap::from_iter([(
+                http::header::CONTENT_TYPE,
+                http::HeaderValue::from_static("text/event-stream"),
+            )]),
+        });
+        let discovery_operations = operations.clone();
+        let generation_operations = operations.clone();
+        let chosen = Server::start(
+            Router::new()
+                .route(
+                    "/v1internal:loadCodeAssist",
+                    post(move |headers: http::HeaderMap| {
+                        let operations = discovery_operations.clone();
+                        async move {
+                            assert_eq!(headers["authorization"], "Bearer synthetic-access");
+                            operations.lock().unwrap().push("discovery");
+                            axum::Json(json!({"cloudaicompanionProject":"synthetic-project"}))
+                        }
+                    }),
+                )
+                .route(
+                    "/v1internal:streamGenerateContent",
+                    post(move |request: Request| {
+                        let state = state.clone();
+                        let operations = generation_operations.clone();
+                        async move {
+                            assert_eq!(
+                                request.uri().path_and_query().unwrap().as_str(),
+                                "/v1internal:streamGenerateContent?alt=sse"
+                            );
+                            operations.lock().unwrap().push("generation");
+                            backend(State(state), request).await
+                        }
+                    }),
+                ),
+        )
+        .await;
+        let directory = tempfile::tempdir().unwrap();
+        // Loopback injection tests shared-origin plumbing, not live Google access.
+        let auth = Auth::new(
+            Config {
+                base_url: chosen.url.clone(),
+                token_url: oauth.url.join("/token").unwrap(),
+                client_id: Some("synthetic-client".into()),
+                ..Config::default()
+            },
+            Store::new(directory.path().join("auth.json")),
+        )
+        .unwrap();
+        let mut callback = None;
+        auth.login_with_opener(|url| {
+            let pairs = url
+                .query_pairs()
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut redirect = url::Url::parse(&pairs["redirect_uri"]).unwrap();
+            redirect.query_pairs_mut().extend_pairs([
+                ("state", pairs["state"].as_ref()),
+                ("code", "synthetic-code"),
+            ]);
+            callback = Some(tokio::spawn(async move {
+                client().get(redirect).send().await.unwrap()
+            }));
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(callback.unwrap().await.unwrap().status(), 200);
+        let proxy = proxy(AntigravityProvider::with_auth(auth), None).await;
+        let response = client()
+            .post(proxy.url.join("/v1/messages").unwrap())
+            .json(&request(stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(response.text().await.unwrap().contains("selected origin"));
+        assert_eq!(
+            *operations.lock().unwrap(),
+            ["token", "discovery", "generation"]
+        );
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0["authorization"], "Bearer synthetic-access");
+        assert_eq!(captured[0].1["project"], "synthetic-project");
+    }
+}
+
+#[tokio::test]
+async fn antigravity_consumer_three_stage_sse_and_nonstream_tool_replay() {
+    // Entirely synthetic: no captured provider signatures, prompts or credentials.
+    let thought = json!({"role":"model","parts":[{"thought":true,"text":"synthetic hidden thought","thoughtSignature":"synthetic-thought-signature"}]});
+    let call = json!({"role":"model","parts":[{"functionCall":{"id":"synthetic-native-call","name":"endpoint_canary_echo","args":{"value":"endpoint-canary-public-nonce"}},"thoughtSignature":"synthetic-call-signature"}]});
+    let tool_reply = format!(
+        "{}{}",
+        frame(json!({"response":{"candidates":[{"content":thought.clone()}]}})),
+        successful(call["parts"].clone())
+    );
+    let (upstream, captured) = native(vec![
+        (200, successful(json!([{"text":"SSE_"},{"text":"TEXT_OK"}]))),
+        (200, tool_reply),
+        (
+            200,
+            successful(json!([{"text":"TOOL_"},{"text":"ROUNDTRIP_OK"}])),
+        ),
+    ])
+    .await;
+    let directory = tempfile::tempdir().unwrap();
+    let proxy = proxy(provider(directory.path(), &upstream.url).await, None).await;
+    let endpoint = proxy.url.join("/v1/messages").unwrap();
+    let mut text_request = request(true);
+    text_request["max_tokens"] = json!(4096);
+    let response = client()
+        .post(endpoint.clone())
+        .json(&text_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let events: Vec<Value> = response
+        .text()
+        .await
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events.first().unwrap()["type"], "message_start");
+    assert_eq!(events.last().unwrap()["type"], "message_stop");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "error" && event["content_block"]["type"] != "tool_use")
+    );
+    let text: String = events
+        .iter()
+        .filter(|event| event["delta"]["type"] == "text_delta")
+        .map(|event| event["delta"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, "SSE_TEXT_OK");
+    let terminal = events
+        .iter()
+        .find(|event| event["type"] == "message_delta")
+        .unwrap();
+    assert_eq!(terminal["delta"]["stop_reason"], "end_turn");
+    assert_eq!(terminal["usage"]["input_tokens"], 10);
+    assert_eq!(terminal["usage"]["output_tokens"], 3);
+
+    let mut tool_request = request(false);
+    tool_request["max_tokens"] = json!(4096);
+    tool_request["messages"] = json!([{"role":"user","content":"Call endpoint_canary_echo with endpoint-canary-public-nonce, then wait for its result."}]);
+    tool_request["tools"] = json!([{"name":"endpoint_canary_echo","input_schema":{"type":"object","properties":{"value":{"type":"string","enum":["endpoint-canary-public-nonce"]}},"required":["value"],"additionalProperties":false}}]);
+    tool_request["tool_choice"] = json!({"type":"auto"});
+    let response = client()
+        .post(endpoint.clone())
+        .json(&tool_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let message: Value = response.json().await.unwrap();
+    assert_eq!(message["stop_reason"], "tool_use");
+    let content = message["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "");
+    assert!(
+        content[0]["signature"]
+            .as_str()
+            .unwrap()
+            .starts_with(replay::PREFIX)
+    );
+    assert_eq!(content[1]["type"], "tool_use");
+    assert_eq!(content[1]["name"], "endpoint_canary_echo");
+    assert_eq!(
+        content[1]["input"],
+        json!({"value":"endpoint-canary-public-nonce"})
+    );
+    let tool_id = content[1]["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .unwrap();
+    // Carry the full nonstream aggregate unchanged, including its leading carrier.
+    tool_request["messages"].as_array_mut().unwrap().extend([
+        json!({"role":"assistant","content":message["content"].clone()}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":tool_id,"content":"endpoint-canary-public-nonce"}]}),
+    ]);
+    let response = client()
+        .post(endpoint)
+        .json(&tool_request)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let final_message: Value = response.json().await.unwrap();
+    assert_eq!(final_message["stop_reason"], "end_turn");
+    let final_content = final_message["content"].as_array().unwrap();
+    assert!(
+        final_content
+            .iter()
+            .all(|block| block["type"] != "tool_use")
+    );
+    let text: String = final_content
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .map(|block| block["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, "TOOL_ROUNDTRIP_OK");
+    assert_eq!(final_message["usage"]["input_tokens"], 10);
+    assert_eq!(final_message["usage"]["output_tokens"], 3);
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 3);
+    for (_, wire) in captured.iter() {
+        assert_eq!(wire["model"], "gemini-4-argon-low");
+        assert_eq!(wire["project"], "project");
+        assert_eq!(wire["request"]["generationConfig"]["maxOutputTokens"], 4096);
+    }
+    let replayed = &captured[2].1["request"];
+    assert_eq!(replayed["sessionId"], captured[1].1["request"]["sessionId"]);
+    assert_eq!(replayed["contents"][1], thought);
+    assert_eq!(replayed["contents"][2], call);
+    assert_eq!(
+        replayed["contents"][3],
+        json!({"role":"model","parts":[{"functionResponse":{"id":"synthetic-native-call","name":"endpoint_canary_echo","response":{"output":"endpoint-canary-public-nonce"}}}]})
+    );
+}
+
+#[tokio::test]
 async fn antigravity_user_agent_generation_wire_matrix() {
     for override_value in [
         None,
